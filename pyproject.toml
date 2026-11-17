@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "leverprice"
+dynamic = ["version"]
+description = "Server-side SDK for Leverprice price experiments"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "Leverprice", email = "support@leverprice.com" }]
+keywords = [
+  "leverprice",
+  "pricing",
+  "price-experiments",
+  "ab-testing",
+  "saas",
+  "checkout",
+  "stripe",
+  "django",
+  "flask",
+  "fastapi",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Framework :: AsyncIO",
+  "Framework :: Django",
+  "Framework :: FastAPI",
+  "Framework :: Flask",
+  "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+  "Topic :: Office/Business :: Financial",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+crypto = ["cryptography>=3.4"]
+
+[project.urls]
+Homepage = "https://leverprice.com"
+Documentation = "https://leverprice.com/docs"
+Repository = "https://github.com/leverprice/leverprice-python"
+Issues = "https://github.com/leverprice/leverprice-python/issues"
+Changelog = "https://github.com/leverprice/leverprice-python/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/leverprice/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/leverprice"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/leverprice", "tests", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "C4", "PIE", "PT", "RET", "TID"]
+ignore = ["UP006", "UP007", "UP035", "UP045", "RUF001", "RUF002", "RUF003", "B904"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["leverprice"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/leverprice"]
+warn_unreachable = true
