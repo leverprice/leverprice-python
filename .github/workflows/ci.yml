@@ -12,15 +12,20 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  LEVERPRICE_REQUIRE_VECTORS: "1"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.13"
-      - run: python -m pip install --upgrade pip ruff mypy
+          activate-environment: true
+          enable-cache: false
+      - run: uv pip install ruff mypy ".[crypto]"
       - run: ruff format --check src tests
       - run: ruff check src tests
       - run: mypy
@@ -34,18 +39,22 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         crypto: [with, without]
-    env:
-      LEVERPRICE_REQUIRE_VECTORS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python }}
-          allow-prereleases: true
-      - run: python -m pip install --upgrade pip pytest
+          activate-environment: true
+          enable-cache: false
+      - run: uv pip install pytest .
       - if: matrix.crypto == 'with'
-        run: python -m pip install cryptography
-      - run: python -m pip install .
+        run: uv pip install cryptography
+      - name: Check the Python version and Ed25519 backend
+        run: >-
+          python -c "import sys; from leverprice import _crypto;
+          print(sys.version, _crypto.backend());
+          assert sys.version.startswith('${{ matrix.python }}.');
+          assert _crypto.backend() == ('cryptography' if '${{ matrix.crypto }}' == 'with' else 'pure')"
       - run: python -m pytest
 
   frameworks:
@@ -55,24 +64,23 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.9", "3.13"]
-    env:
-      LEVERPRICE_REQUIRE_VECTORS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install --upgrade pip pytest cryptography django flask starlette multidict
-      - run: python -m pip install .
+          activate-environment: true
+          enable-cache: false
+      - run: uv pip install pytest cryptography django flask starlette multidict .
       - run: python -m pytest
 
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.13"
-      - run: python -m pip install --upgrade pip build twine
-      - run: python -m build
-      - run: python -m twine check --strict dist/*
+          enable-cache: false
+      - run: uv build
+      - run: uvx twine check --strict dist/*
