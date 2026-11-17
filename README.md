@@ -8,9 +8,9 @@
 </p>
 
 <p>
-  <a href="https://pypi.org/project/leverprice/"><img alt="PyPI" src="https://img.shields.io/pypi/v/leverprice?label=pypi&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
+  <a href="https://pypi.org/project/leverprice/"><img alt="PyPI" src="https://img.shields.io/pypi/v/leverprice?label=pypi&style=flat-square&labelColor=0F1011&color=3C3F44"></a>
   <a href="https://github.com/leverprice/leverprice-python/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/leverprice/leverprice-python/ci.yml?branch=main&label=ci&style=flat-square&labelColor=0F1011"></a>
-  <a href="https://github.com/leverprice/leverprice-python/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-5B4CF5?style=flat-square&labelColor=0F1011"></a>
+  <a href="https://github.com/leverprice/leverprice-python/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-3C3F44?style=flat-square&labelColor=0F1011"></a>
 </p>
 
 Server-side SDK for [Leverprice](https://leverprice.com) price experiments. No required dependencies, Python 3.9+, works with Django, Flask, FastAPI, Starlette, aiohttp and plain WSGI/ASGI.
