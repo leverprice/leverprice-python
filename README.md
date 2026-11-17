@@ -1,8 +1,16 @@
-# Leverprice Python SDK
+<a href="https://leverprice.com">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/python-dark.svg">
+    <img alt="Leverprice SDK for Python" src="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/python-light.svg" width="100%">
+  </picture>
+</a>
 
-[![PyPI](https://img.shields.io/pypi/v/leverprice.svg)](https://pypi.org/project/leverprice/)
-[![CI](https://github.com/leverprice/leverprice-python/actions/workflows/ci.yml/badge.svg)](https://github.com/leverprice/leverprice-python/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/pypi/pyversions/leverprice.svg)](https://pypi.org/project/leverprice/)
+<p>
+  <a href="https://pypi.org/project/leverprice/"><img alt="PyPI" src="https://img.shields.io/pypi/v/leverprice?label=pypi&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
+  <a href="https://pypi.org/project/leverprice/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/leverprice?label=python&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
+  <a href="https://github.com/leverprice/leverprice-python/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/leverprice/leverprice-python/ci.yml?branch=main&label=ci&style=flat-square&labelColor=0F1011"></a>
+  <a href="https://github.com/leverprice/leverprice-python/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-5B4CF5?style=flat-square&labelColor=0F1011"></a>
+</p>
 
 Server-side SDK for [Leverprice](https://leverprice.com) price experiments. No required dependencies, Python 3.9+, works with Django, Flask, FastAPI, Starlette, aiohttp and plain WSGI/ASGI.
 
