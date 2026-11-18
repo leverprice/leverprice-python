@@ -52,7 +52,15 @@ from leverprice import (
     _client,
 )
 from leverprice._ed25519 import decode_point
-from leverprice._wire import MAX_REGIONS, MAX_SCOPE, MAX_SPLITS, ConfigExperiment, ConfigRegion, parse_config
+from leverprice._wire import (
+    MAX_REGIONS,
+    MAX_SCOPE,
+    MAX_SPLITS,
+    STANDARD_LEVEL,
+    ConfigExperiment,
+    ConfigRegion,
+    parse_config,
+)
 
 KEYS = SigningKeys()
 
@@ -92,7 +100,7 @@ def test_public_constants() -> None:
         assert len(raw) == 32
         assert decode_point(raw) is not None
     assert MIN_KEYSET_VERSION == 1
-    assert SDK_VERSION == leverprice.__version__ == "0.4.0"
+    assert SDK_VERSION == leverprice.__version__ == "0.4.1"
     with pytest.raises(TypeError):
         ROOT_PUBLIC_KEYS["r2"] = "x"  # type: ignore[index]
 
@@ -107,11 +115,11 @@ def test_request_headers_and_body(server: FakeServer, errors: List[Exception]) -
     assert post.url == "https://api.example.test/v1/events"
     for call in (get, post):
         assert call.headers["Authorization"] == f"Bearer {SECRET}"
-        assert call.headers["User-Agent"] == "leverprice-sdk-python/0.4.0"
+        assert call.headers["User-Agent"] == "leverprice-sdk-python/0.4.1"
         assert not any(k.lower() == "origin" for k in call.headers)
     assert "If-None-Match" not in get.headers
     assert post.headers["Content-Type"] == "application/json"
-    assert json.loads(post.body or b"")["sdk"] == {"name": "leverprice-python", "version": "0.4.0"}
+    assert json.loads(post.body or b"")["sdk"] == {"name": "leverprice-python", "version": "0.4.1"}
     assert errors == []
 
 
@@ -124,24 +132,46 @@ def test_cold_start_times_out(server: FakeServer, errors: List[Exception]) -> No
 
     server.config_handler = slow
     lp = make_client(server, errors=errors, timeout_ms=150)
-    ends: List[float] = []
+    waits: List[float] = []
     quotes: List[Any] = []
 
     def visit(delay: float) -> None:
         time.sleep(delay)
+        started = time.monotonic()
         quotes.append(lp.get_price("pro", new_visitor()))
-        ends.append(time.monotonic())
+        waits.append(time.monotonic() - started)
 
-    start = time.monotonic()
     threads = [threading.Thread(target=visit, args=(d,)) for d in (0, 0.04, 0.08)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    release.set()
     assert all(q.reason == "no_config" and q.set_cookie == [PIN] and q.price == 1900 for q in quotes)
-    assert 0.12 <= max(ends) - start < 1.0
-    assert max(ends) - min(ends) < 0.1
+    assert all(0.12 <= w < 1.0 for w in waits), waits
+    assert len(server.config_calls) == 1
+    assert messages(errors) == [
+        "Leverprice config: still loading after 150 ms (timeout_ms); serving fallback prices until it arrives"
+    ]
+    release.set()
+
+
+def test_cold_start_wait_is_not_shortened_by_preload(server: FakeServer, errors: List[Exception]) -> None:
+    release = threading.Event()
+
+    def held(call: Call) -> TransportResponse:
+        release.wait(5)
+        return server._serve_config(call)
+
+    server.config_handler = held
+    lp = make_client(server, errors=errors, timeout_ms=400)
+    threading.Thread(target=lp.preload, daemon=True).start()  # started at boot, not awaited
+    time.sleep(0.25)
+    # The config arrives 450 ms after preload() started, 200 ms into this request's own wait.
+    threading.Timer(0.2, release.set).start()
+    quote = lp.get_price("pro", new_visitor())
+    assert quote.reason != "no_config"
+    assert not quote.is_fallback
+    assert errors == []
     assert len(server.config_calls) == 1
 
 
@@ -448,7 +478,8 @@ def test_malformed_regions_drop_the_product(errors: List[Exception]) -> None:
 
     assert (parsed["flat"].regions, parsed["flat"].region_of) == ((), {})
     assert (parsed["none"].regions, parsed["none"].region_of) == ((), {})
-    assert parsed["geo"].regions[1] == ConfigRegion(("IN",), "inr", 99_900)
+    # No level in the config: it compares as the standard price, so it never holds a price.
+    assert parsed["geo"].regions[1] == ConfigRegion(("IN",), "inr", 99_900, STANDARD_LEVEL)
     assert parsed["geo"].region_of == {"BR": 0, "MX": 0, "IN": 1}
     assert len(parsed["most"].regions) == MAX_REGIONS
     assert regional("test") == [(1300, 64_900), (2700, 129_900)]
@@ -531,6 +562,30 @@ def test_config_country_header_is_kept_only_when_it_is_a_header_name() -> None:
     assert parsed(countryHeader="X-Geo-Country") == "x-geo-country"
     for value in ("x-geo-country\n", " cf-ipcountry", "cf ipcountry", "\u212aey", "", None, 42, ["cf-ipcountry"]):
         assert parsed(countryHeader=value) is None, value
+    for value in ("Accept-Language", "x-forwarded-for", "X-Real-IP", "sec-ch-ua", "user-agent", "forwarded"):
+        assert parsed(countryHeader=value) is None, value
+
+
+def test_country_hold_and_region_levels_never_reject_a_config() -> None:
+    def hold(value: Any) -> int:
+        config, _ = parse_config(b64url(json.dumps({**config_payload(), "countryHold": value}).encode()))
+        return config.country_hold
+
+    assert hold(604_800) == 604_800
+    assert hold(7_776_000.0) == 7_776_000
+    for value in (0, -1, 7_776_001, 1.5, "604800", True, None, [1], 2**53):
+        assert hold(value) == 0, value
+    assert parse_config(b64url(json.dumps(config_payload()).encode()))[0].country_hold == 0
+
+    levels = {"IN": 4138, "CH": 12_069.0, "BR": 0, "MX": -5, "AR": 1.5, "CL": "9000", "PE": True, "UY": None}
+    regions = [
+        {"countries": [code], "currency": "usd", "price": 2000, "level": level} for code, level in levels.items()
+    ]
+    regions.append({"countries": ["CO"], "currency": "usd", "price": 2000})
+    product = {"id": "prod", "currency": "usd", "price": 2900, "minPrice": 1000, "maxPrice": 4900, "regions": regions}
+    config, dropped = parse_config(b64url(json.dumps(config_payload(products={"geo": product})).encode()))
+    assert dropped == []
+    assert [region.level for region in config.products["geo"].regions] == [4138, 12_069] + [STANDARD_LEVEL] * 7
 
 
 def test_events_failure_requeues_money_and_drops_exposures(server: FakeServer, errors: List[Exception]) -> None:
@@ -1108,6 +1163,37 @@ def test_country_header_is_validated_before_it_is_lowercased() -> None:
     assert Leverprice(SECRET, {})._country_header is None
 
 
+@pytest.mark.parametrize("header", ["Accept-Language", "x-forwarded-for", "X-Real-IP", "sec-ch-ua", "user-agent"])
+def test_country_header_that_visitors_send_is_ignored_and_reported_once(errors: List[Exception], header: str) -> None:
+    payload = {**config_payload(products=regional_products()), "countryHeader": "X-Geo-Country"}
+    server = FakeServer(KEYS.envelope(payload))
+    lp = make_client(server, errors=errors, products=REGIONAL_GUARDS, country_header=header)
+    assert messages(errors) == [
+        f'Leverprice: country_header "{header.lower()}" is sent by visitors\' browsers, so it would let them pick '
+        "their own price; it is ignored. Name the header your CDN or host sets, such as cf-ipcountry."
+    ]
+    assert lp._country_header is None
+    chosen = lp.get_price("geo", {header: "MX"}, user_agent=CHROME)
+    assert (chosen.country, chosen.price, chosen.regional) == (None, 2900, False)
+    # Ignored as if it were not set: the project's header is read.
+    project = lp.get_price("geo", {header: "MX", "x-geo-country": "BR"}, user_agent=CHROME)
+    assert (project.country, project.price, project.regional) == ("BR", 2000, True)
+    assert len(errors) == 1
+
+
+def test_country_headers_set_by_hosts_and_disabled_clients_report_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    errors: List[Exception] = []
+    for header in ("cf-ipcountry", "x-vercel-ip-country", "CloudFront-Viewer-Country", "x-geo-country", "x-forwarded"):
+        assert Leverprice(SECRET, {}, country_header=header, on_error=errors.append)._country_header == header.lower()
+    Leverprice(SECRET, {}, country_header="accept-language", on_error=errors.append, disabled=True)
+    monkeypatch.setenv("LEVERPRICE_DISABLED", "1")
+    Leverprice(SECRET, {}, country_header="accept-language", on_error=errors.append)
+    assert errors == []
+    monkeypatch.delenv("LEVERPRICE_DISABLED")
+    Leverprice(None, {}, country_header="accept-language", on_error=errors.append)
+    assert len(errors) == 1
+
+
 def test_option_validation() -> None:
     with pytest.raises(ValueError, match="cookie_name"):
         Leverprice(SECRET, {}, cookie_name="bad name")
@@ -1154,3 +1240,133 @@ def test_context_manager_flushes(server: FakeServer, errors: List[Exception]) ->
         lp.get_price("pro", new_visitor())
     assert len(server.events) == 1
     assert lp._timer is None
+
+
+def test_products_are_named_on_every_config_request(server: FakeServer, errors: List[Exception]) -> None:
+    products = {
+        "team": {"currency": "EUR", "fallback_price": 4900},
+        "pro plan": {"currency": "usd", "fallback_price": 1900},
+        "\u00e9t\u00e9": {"currency": "usd", "fallback_price": 900},
+    }
+    lp = make_client(server, errors=errors, products=products)
+    lp.refresh()
+    lp.refresh()
+    server.config_handler = lambda call: TransportResponse(503, {}, b"")
+    lp.refresh()
+    lp.refresh()
+    assert len(server.config_calls) == 4
+    for call in server.config_calls:
+        assert call.headers["Leverprice-Products"] == "%C3%A9t%C3%A9=usd, pro%20plan=usd, team=eur"
+        assert "Leverprice-Config-Error" not in call.headers  # an outage is not a refused config
+    assert make_client(server, products={})._products_header == ""
+
+
+def test_a_refused_config_is_reported_until_one_is_accepted(server: FakeServer, errors: List[Exception]) -> None:
+    valid = json.dumps(server.envelope)
+    responses = [
+        TransportResponse(200, {}, b"not json"),
+        TransportResponse(200, {}, b'{"payload": "x"}'),
+        TransportResponse(503, {}, b""),
+        TransportResponse(200, {"ETag": '"v5"'}, valid),
+        TransportResponse(200, {}, json.dumps(KEYS.envelope(config_payload(4)))),
+        TransportResponse(304, {}, b""),
+        TransportResponse(200, {}, valid),
+        TransportResponse(200, {}, valid),
+    ]
+    server.config_handler = lambda call: responses.pop(0)
+    lp = make_client(server, errors=errors)
+    for _ in range(8):
+        lp.refresh()
+    assert [call.headers.get("Leverprice-Config-Error") for call in server.config_calls] == [
+        None,
+        "malformed",
+        "malformed",
+        "malformed",
+        None,
+        "rollback",
+        "rollback",
+        None,
+    ]
+    assert "If-None-Match" in server.config_calls[5].headers
+    assert lp._config_error is None
+
+
+def cookieless(form: str) -> Any:
+    if form == "headers":
+        return {"user-agent": CHROME, "accept-language": "en", "x-forwarded-for": "203.0.113.7, 10.0.0.1"}
+    if form == "environ":
+        return {"REQUEST_METHOD": "GET", "HTTP_USER_AGENT": CHROME, "REMOTE_ADDR": "203.0.113.7"}
+    if form == "asgi":
+        return {"type": "http", "headers": [(b"user-agent", CHROME.encode())], "client": ("2001:db8:1:2::7", 443)}
+    return SimpleNamespace(headers={"User-Agent": CHROME}, client=SimpleNamespace(host="203.0.113.7"))
+
+
+@pytest.mark.parametrize("form", ["headers", "environ", "asgi", "object"])
+def test_a_visitor_without_cookies_but_with_an_address_is_one_visitor(
+    server: FakeServer, errors: List[Exception], form: str
+) -> None:
+    lp = make_client(server, errors=errors)
+    quotes = [lp.get_price("pro", cookieless(form)) for _ in range(20)]
+    lp.flush()
+    assert len({q.visitor_id for q in quotes}) == 1
+    assert len({q.variant_id for q in quotes}) == 1
+    assert len(server.events) == 1
+    assert errors == []
+
+
+def test_a_visitor_without_cookies_or_an_address_is_new_every_time(server: FakeServer, errors: List[Exception]) -> None:
+    lp = make_client(server, errors=errors)
+    quotes = [lp.get_price("pro", {"user-agent": CHROME, "accept-language": "en"}) for _ in range(20)]
+    lp.flush()
+    assert len({q.visitor_id for q in quotes}) == 20
+    assert len(server.events) == 20
+    elsewhere = lp.get_price("pro", {**cookieless("headers"), "x-forwarded-for": "203.0.113.8"})
+    other_browser = lp.get_price("pro", {**cookieless("headers"), "user-agent": CHROME + " Edg/142"})
+    assert (
+        len({lp.get_price("pro", cookieless("headers")).visitor_id, elsewhere.visitor_id, other_browser.visitor_id})
+        == 3
+    )
+
+
+HOLD_GUARDS: Dict[str, Dict[str, Any]] = {"geo": {"currency": "usd", "fallback_price": 2900}}
+
+
+def hold_server(hold: int = 604_800) -> FakeServer:
+    regions = [{"countries": ["IN"], "currency": "usd", "price": 1200, "level": 4138}]
+    product = {
+        "id": "prod_geo",
+        "currency": "usd",
+        "price": 2900,
+        "minPrice": 1000,
+        "maxPrice": 4900,
+        "regions": regions,
+    }
+    return FakeServer(KEYS.envelope({**config_payload(products={"geo": product}), "countryHold": hold}))
+
+
+def test_vpn_guard_keeps_a_dearer_country_until_the_hold_runs_out(errors: List[Exception]) -> None:
+    clock = Clock()
+    lp = make_client(hold_server(), errors=errors, products=HOLD_GUARDS)
+    lp._clock = clock
+    home = lp.get_price("geo", new_visitor(), country="US")
+    assert (home.price, home.country, home.regional) == (2900, "US", False)
+    state = decode_cookie(home.set_cookie[0])
+    assert (state["c"], state["t"]) == ("US", clock.now // 1000)
+    cookie = {"user-agent": CHROME, "cookie": home.set_cookie[0].split(";", 1)[0]}
+    clock.advance(3_600_000)
+    away = lp.get_price("geo", cookie, country="IN")
+    assert (away.price, away.country, away.regional, away.set_cookie) == (2900, "US", False, [])
+    crawler = lp.get_price("geo", {**cookie, "user-agent": GOOGLEBOT}, country="IN")
+    assert (crawler.reason, crawler.country, crawler.set_cookie) == ("bot", None, [])
+    clock.advance(604_800_000)
+    later = lp.get_price("geo", cookie, country="IN")
+    assert (later.price, later.country, later.regional) == (1200, "IN", True)
+    assert decode_cookie(later.set_cookie[0])["c"] == "IN"
+    assert errors == []
+
+
+def test_vpn_guard_is_off_without_a_hold(errors: List[Exception]) -> None:
+    lp = make_client(hold_server(0), errors=errors, products=HOLD_GUARDS)
+    home = lp.get_price("geo", new_visitor(), country="US")
+    assert (home.price, home.country, home.set_cookie) == (2900, "US", [])
+    assert errors == []

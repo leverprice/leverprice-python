@@ -207,6 +207,9 @@ def test_django_request(lp: Leverprice) -> None:
     assert not pro.exposure_logged
     assert pro.visitor_id == team.visitor_id
     assert country_of(request) == "IN"
+    # No assignment cookie: the same address (REMOTE_ADDR) and browser are the same visitor.
+    again = RequestFactory().get("/", HTTP_USER_AGENT=CHROME)
+    assert lp.get_price("pro", again).visitor_id == pro.visitor_id
     response = apply_cookies(HttpResponse("ok"), team)
     header = response.cookies["__pp"].output(header="Set-Cookie:")
     for part in ("Max-Age=15552000", "Path=/", "SameSite=Lax", "HttpOnly", "Secure"):
@@ -226,6 +229,11 @@ def test_flask_request(lp: Leverprice) -> None:
         assert response.headers.getlist("Set-Cookie") == team.set_cookie
     with app.test_request_context("/", headers={"User-Agent": CHROME}):
         assert lp.get_price("pro", flask.request).visitor_id != pro.visitor_id
+    seen = []
+    for _ in range(2):
+        with app.test_request_context("/", headers={"User-Agent": CHROME}, environ_base={"REMOTE_ADDR": "203.0.113.7"}):
+            seen.append(lp.get_price("pro", flask.request).visitor_id)
+    assert seen[0] == seen[1] != pro.visitor_id
 
 
 def test_starlette_request(lp: Leverprice) -> None:
@@ -251,6 +259,8 @@ def test_starlette_request(lp: Leverprice) -> None:
     quote = lp.get_price("pro", fresh)
     response = apply_cookies(Response("ok"), quote)
     assert response.headers.getlist("set-cookie") == quote.set_cookie
+    client = {**scope, "headers": scope["headers"][:1], "client": ("203.0.113.7", 50_000)}
+    assert lp.get_price("pro", Request(client)).visitor_id == lp.get_price("pro", Request(client)).visitor_id
 
 
 def test_multidict_headers(lp: Leverprice) -> None:

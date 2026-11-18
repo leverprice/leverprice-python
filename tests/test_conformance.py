@@ -1,19 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest
 
-from _support import QUOTE_GUARDS, FakeServer, Headers, load_vectors
-from leverprice import Leverprice, LeverpriceError, is_bot
+from _support import QUOTE_GUARDS, Call, FakeServer, Headers, load_vectors
+from leverprice import Leverprice, LeverpriceError, TransportResponse, is_bot
 from leverprice._client import _bucket, _pick_variant
 from leverprice._cookie import AssignmentState, assign, mark_exposed, set_cookie_header, sign_assignment, state_json
 from leverprice._cookie import verify_assignment as verify_cookie
-from leverprice._request import cookie_values, is_prefetch, normalize_country
+from leverprice._request import (
+    client_address,
+    cookie_values,
+    header_source,
+    is_prefetch,
+    normalize_address,
+    normalize_country,
+    visitor_set_header,
+)
 from leverprice._trust import TrustChain, accept_config, key_fingerprint
 from leverprice._util import from_b64url, hmac_hex
-from leverprice._wire import Config, ConfigVariant, event_problem
+from leverprice._wire import Config, ConfigError, ConfigVariant, event_problem
 
 VECTORS = load_vectors()
 KEY = from_b64url(VECTORS["assignmentKey"])
@@ -42,13 +53,61 @@ def test_trust(case: Dict[str, Any], ed25519_backend: str) -> None:
     for step in case["steps"]:
         now = step.get("now", VECTORS["now"])
         if step["expect"] == "reject":
-            with pytest.raises(LeverpriceError):
+            with pytest.raises(ConfigError) as refused:
                 accept_config(chain, fingerprint, current, step["envelope"], now)
+            assert refused.value.code == step["code"]
+            assert isinstance(refused.value, LeverpriceError)
             continue
         verified = accept_config(chain, fingerprint, current, step["envelope"], now)
         assert verified.config.version == step["version"]
         assert verified.dropped == step["dropped"]
+        if "countryHeader" in step:
+            assert verified.config.country_header == step["countryHeader"]
         current = verified.config
+
+
+@pytest.mark.parametrize("case", VECTORS["trust"], ids=lambda c: c["name"])
+def test_trust_through_the_client(case: Dict[str, Any], ed25519_backend: str) -> None:
+    served: Dict[str, Any] = {}
+    sent: List[Optional[str]] = []
+
+    def serve(call: Call) -> TransportResponse:
+        sent.append(call.headers.get("Leverprice-Config-Error"))
+        return TransportResponse(200, {"ETag": '"x"'}, json.dumps(served["envelope"]))
+
+    server = FakeServer()
+    server.config_handler = serve
+    errors: List[Exception] = []
+    lp = Leverprice(
+        VECTORS["secretKey"],
+        QUOTE_GUARDS,
+        trusted_root_keys=VECTORS["rootKeys"],
+        transport=server,
+        on_error=errors.append,
+    )
+    lp._trust._min_keyset_version = case.get("minKeysetVersion", 1)
+    reported: Optional[str] = None
+    for step in case["steps"]:
+        now = step.get("now", VECTORS["now"])
+        lp._clock = lambda now=now: now
+        before = lp._config
+        served["envelope"] = step["envelope"]
+        lp.refresh()
+        after = lp._config
+        accepted = after is not None and after is not before
+        assert ("accept" if accepted else "reject") == step["expect"]
+        assert sent[-1] == reported
+        if accepted:
+            assert after is not None
+            assert after.version == step["version"]
+            if "countryHeader" in step:
+                assert after.country_header == step["countryHeader"]
+        # What the next config request reports in Leverprice-Config-Error.
+        reported = None if accepted else step["code"]
+        assert lp._config_error == reported
+    assert len([e for e in errors if "malformed products" not in str(e)]) == sum(
+        step["expect"] == "reject" for step in case["steps"]
+    )
 
 
 @pytest.mark.parametrize("case", VECTORS["visitorIds"], ids=lambda c: c["visitorKey"])
@@ -190,3 +249,110 @@ _SNAKE = {"fallbackPrice": "fallback_price", "minPrice": "min_price", "maxPrice"
 
 def _snake_guard(guard: Dict[str, Any]) -> Dict[str, Any]:
     return {_SNAKE.get(k, k): v for k, v in guard.items()}
+
+
+@pytest.mark.parametrize("case", VECTORS["countryHeaderNames"], ids=lambda c: c["name"])
+def test_country_header_names(case: Dict[str, Any]) -> None:
+    assert (not visitor_set_header(case["name"])) is case["allowed"]
+
+
+@pytest.mark.parametrize("case", VECTORS["addresses"], ids=lambda c: repr(c["value"]))
+def test_addresses(case: Dict[str, Any]) -> None:
+    assert normalize_address(case["value"]) == case["address"]
+
+
+def _address_requests(headers: Dict[str, str], remote: Optional[str]) -> Dict[str, Any]:
+    environ = {"HTTP_" + k.upper().replace("-", "_"): v for k, v in headers.items()}
+    pairs = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    client = SimpleNamespace(host=remote) if remote is not None else None
+    return {
+        "environ": {"REQUEST_METHOD": "GET", **environ, **({"REMOTE_ADDR": remote} if remote is not None else {})},
+        "asgi": {"type": "http", "headers": pairs, "client": (remote, 5000) if remote is not None else None},
+        "django": SimpleNamespace(META={**environ, **({"REMOTE_ADDR": remote} if remote is not None else {})}),
+        "flask": SimpleNamespace(headers=headers, remote_addr=remote),
+        "aiohttp": SimpleNamespace(headers=headers, remote=remote),
+        "starlette": SimpleNamespace(headers=headers, client=client),
+    }
+
+
+@pytest.mark.parametrize("case", VECTORS["clientAddresses"], ids=lambda c: json.dumps(c))
+def test_client_addresses(case: Dict[str, Any]) -> None:
+    if "remoteAddress" not in case:
+        assert client_address(header_source(case["headers"]), case["headers"]) == case["address"]
+    for form, request in _address_requests(case["headers"], case.get("remoteAddress")).items():
+        assert client_address(header_source(request), request) == case["address"], form
+
+
+@pytest.mark.parametrize("case", VECTORS["anonVisitors"], ids=lambda c: c["v"])
+def test_anon_visitors(case: Dict[str, Any]) -> None:
+    assert case["message"] == f"pp:anon:v1:{case['address']}\n{case['userAgent']}\n{case['acceptLanguage']}"
+    assert hmac_hex(KEY, case["message"], 32) == case["v"]
+
+
+@pytest.mark.parametrize("case", VECTORS["productsHeader"], ids=lambda c: c["header"][:40] or "none")
+def test_products_header(case: Dict[str, Any]) -> None:
+    server = FakeServer()
+    server.config_handler = lambda call: TransportResponse(503, {}, b"{}")
+    products = {key: _snake_guard(guard) for key, guard in case["products"].items()}
+    Leverprice(VECTORS["secretKey"], products, transport=server, on_error=lambda e: None).refresh()
+    assert [call.headers["Leverprice-Products"] for call in server.config_calls] == [case["header"]]
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("case", VECTORS["countryHold"]["cases"], ids=lambda c: c["name"])
+def test_country_hold(case: Dict[str, Any], mode: str) -> None:
+    hold = VECTORS["countryHold"]
+    now = int(time.time())
+    cookie: Optional[str] = None
+    signed_t: Optional[int] = None
+    held = case["cookie"]
+    if held is not None:
+        signed_t = now - held["age"] if "age" in held else None
+        state = AssignmentState(hold["visitor"], dict(held.get("a", [])), list(held.get("x", [])))
+        if "c" in held:
+            state.c, state.t = held["c"], signed_t
+        cookie = sign_assignment(KEY, state)
+    server = FakeServer(hold["config"])
+    errors: List[Exception] = []
+    lp = Leverprice(
+        VECTORS["secretKey"],
+        {key: _snake_guard(guard) for key, guard in hold["guards"].items()},
+        trusted_root_keys=VECTORS["rootKeys"],
+        transport=server,
+        on_error=errors.append,
+        timeout_ms=10_000,
+        local_currencies=case.get("localCurrencies", False),
+    )
+    headers = {"user-agent": "Mozilla/5.0 Chrome/131.0"}
+    if "country" in case:
+        headers["x-geo-country"] = case["country"]
+    if cookie is not None:
+        headers["cookie"] = f"__pp={cookie}"
+    if mode == "async":
+        quote = asyncio.run(lp.get_price_async(case["productKey"], headers))
+    else:
+        quote = lp.get_price(case["productKey"], headers)
+    lp.flush()
+
+    set_cookie = next((h for h in quote.set_cookie if h.startswith("__pp=")), None)
+    back = verify_cookie(KEY, set_cookie[5:].split(";")[0]) if set_cookie is not None else None
+    got = {
+        "price": quote.price,
+        "currency": quote.currency,
+        "country": quote.country,
+        "regional": quote.regional,
+        "reason": quote.reason,
+        "variantId": quote.variant_id,
+        "exposures": [{k: v for k, v in e.items() if k not in ("timestamp", "visitorId")} for e in server.events],
+        "cookie": back
+        and {
+            "c": back.c,
+            "t": None if back.t is None else "kept" if back.t == signed_t else "fresh",
+            "a": [[k, v] for k, v in back.a.items()],
+        },
+    }
+    assert got == case["expect"]
+    if back is not None and back.t is not None and back.t != signed_t:
+        assert abs(back.t - now) < 5
+    assert errors == []
+    lp.close()

@@ -127,6 +127,71 @@ def test_cold_start_does_not_block_the_loop() -> None:
     assert len(server.config_calls) == 1
 
 
+def test_async_cold_start_wait_is_not_shortened_by_preload() -> None:
+    release = threading.Event()
+    server = FakeServer(KEYS.envelope(config_payload()))
+
+    def held(call: Call) -> TransportResponse:
+        release.wait(5)
+        return server._serve_config(call)
+
+    server.config_handler = held
+    errors: List[Exception] = []
+    lp = make_client(server, errors=errors, timeout_ms=400)
+
+    async def main() -> None:
+        threading.Thread(target=lp.preload, daemon=True).start()  # started at boot, not awaited
+        await asyncio.sleep(0.25)
+        # The config arrives 450 ms after preload() started, 200 ms into this request's own wait.
+        threading.Timer(0.2, release.set).start()
+        quote = await lp.get_price_async("pro", {"user-agent": CHROME})
+        assert quote.reason != "no_config"
+        assert not quote.is_fallback
+
+    asyncio.run(main())
+    assert errors == []
+    assert len(server.config_calls) == 1
+
+
+def test_get_price_async_keeps_a_cookieless_visitor() -> None:
+    server = FakeServer(KEYS.envelope(config_payload()))
+    lp = make_client(server)
+
+    async def main() -> None:
+        scope = {"type": "http", "headers": [(b"user-agent", CHROME.encode())], "client": ("203.0.113.7", 50_000)}
+        quotes = [await lp.get_price_async("pro", dict(scope)) for _ in range(20)]
+        assert len({q.visitor_id for q in quotes}) == 1
+        anonymous = [await lp.get_price_async("pro", {"user-agent": CHROME}) for _ in range(3)]
+        assert len({q.visitor_id for q in anonymous}) == 3
+        await lp.flush_async()
+
+    asyncio.run(main())
+    assert len(server.events) == 4
+
+
+def test_get_price_async_holds_a_dearer_country() -> None:
+    product = {
+        "id": "prod_geo",
+        "currency": "usd",
+        "price": 2900,
+        "minPrice": 1000,
+        "maxPrice": 4900,
+        "regions": [{"countries": ["IN"], "currency": "usd", "price": 1200, "level": 4138}],
+    }
+    server = FakeServer(KEYS.envelope({**config_payload(products={"geo": product}), "countryHold": 604_800}))
+    lp = make_client(server, products={"geo": {"currency": "usd", "fallback_price": 2900}})
+
+    async def main() -> None:
+        home = await lp.get_price_async("geo", {"user-agent": CHROME}, country="US")
+        cookie = home.set_cookie[0].split(";", 1)[0]
+        away = await lp.get_price_async("geo", {"user-agent": CHROME, "cookie": cookie}, country="IN")
+        assert (away.price, away.country, away.regional, away.set_cookie) == (2900, "US", False, [])
+        new = await lp.get_price_async("geo", {"user-agent": CHROME}, country="IN")
+        assert (new.price, new.country, new.regional, len(new.set_cookie)) == (1200, "IN", True, 1)
+
+    asyncio.run(main())
+
+
 def test_async_quotes_of_one_request_share_the_cookie() -> None:
     server = FakeServer(KEYS.envelope(config_payload()))
     lp = make_client(server)

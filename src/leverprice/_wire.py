@@ -3,8 +3,9 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Literal, Mapping, Optional, Tuple
 
+from ._request import visitor_set_header
 from ._util import (
     COUNTRY_RE,
     JS_WHITESPACE,
@@ -26,6 +27,9 @@ MAX_REGIONS = 300
 MAX_SPLITS = 300
 MAX_SCOPE = 300
 PROVIDERS = ("stripe", "polar", "lemonsqueezy", "dodo", "paddle", "creem", "other")
+STANDARD_LEVEL = 10_000
+"""The level of a country without a regional price: the standard price."""
+MAX_COUNTRY_HOLD = 90 * 86_400
 
 _CURRENCY_RE = re.compile(r"[A-Za-z]{3}")
 _WIRE_CURRENCY_RE = re.compile(r"[a-z]{3}")
@@ -33,6 +37,19 @@ _FINGERPRINT_RE = re.compile(r"[0-9a-f]{16}")
 _SIGNATURE_RE = re.compile(r"[0-9a-f]{16}")
 _HTTPS_RE = re.compile(r"https://[^" + re.escape(JS_WHITESPACE) + r"]+", re.IGNORECASE)
 _HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+ConfigErrorCode = Literal[
+    "untrusted", "bad_signature", "expired", "wrong_key", "wrong_project", "rollback", "malformed"
+]
+
+
+class ConfigError(LeverpriceError):
+    """A refused config; ``code`` is sent back to the server in ``Leverprice-Config-Error``."""
+
+    def __init__(self, code: ConfigErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -58,6 +75,8 @@ class ConfigRegion:
     countries: Tuple[str, ...]
     currency: str
     price: int
+    level: int = STANDARD_LEVEL
+    """The price as basis points of the standard price (10000 = the same), to compare countries."""
 
 
 @dataclass(frozen=True)
@@ -83,6 +102,8 @@ class Config:
     key_fingerprints: Tuple[str, ...]
     country_header: Optional[str] = None
     products: Dict[str, ConfigProduct] = field(default_factory=dict)
+    country_hold: int = 0
+    """Seconds a visitor keeps the price of a dearer country they were seen in. 0: off."""
 
 
 def parse_config(payload: str) -> Tuple[Config, List[str]]:
@@ -135,6 +156,7 @@ def parse_config(payload: str) -> Tuple[Config, List[str]]:
         key_fingerprints=tuple(fingerprints),
         country_header=_header_name(raw.get("countryHeader")),
         products=parsed,
+        country_hold=_country_hold(raw.get("countryHold")),
     )
     return config, dropped
 
@@ -195,7 +217,9 @@ def _parse_regions(raw: Any) -> Optional[Tuple[ConfigRegion, ...]]:
             return None
         if not isinstance(currency, str) or not _CURRENCY_RE.fullmatch(currency):
             return None
-        regions.append(ConfigRegion(tuple(countries), currency.lower(), price))
+        # A level this SDK can't read compares as the standard price: it never holds a price.
+        level = _positive_int(r.get("level")) or STANDARD_LEVEL
+        regions.append(ConfigRegion(tuple(countries), currency.lower(), price, level))
     return tuple(regions)
 
 
@@ -282,7 +306,14 @@ def _https_url(v: Any) -> Optional[str]:
 
 
 def _header_name(v: Any) -> Optional[str]:
-    return v.lower() if isinstance(v, str) and _HEADER_NAME_RE.fullmatch(v) else None
+    if isinstance(v, str) and _HEADER_NAME_RE.fullmatch(v) and not visitor_set_header(v):
+        return v.lower()
+    return None
+
+
+def _country_hold(v: Any) -> int:
+    n = safe_int(v)
+    return n if n is not None and 0 < n <= MAX_COUNTRY_HOLD else 0
 
 
 def _decoded_length(b64: str) -> int:

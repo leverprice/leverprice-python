@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ._util import ID_RE, b64url, from_b64url, from_utf8, hmac_sha256, json_loads, utf8
+from ._util import COUNTRY_RE, ID_RE, b64url, from_b64url, from_utf8, hmac_sha256, json_loads, safe_int, utf8
 
 MAX_COOKIE_EXPERIMENTS = 10
 MAX_COOKIE_LENGTH = 4096
@@ -22,9 +22,13 @@ class AssignmentState:
     v: str
     a: Dict[str, str] = field(default_factory=dict)
     x: List[str] = field(default_factory=list)
+    c: Optional[str] = None
+    """The country whose price the visitor holds (VPN guard)."""
+    t: Optional[int] = None
+    """When ``c`` was set, in seconds since the epoch."""
 
     def clone(self) -> AssignmentState:
-        return AssignmentState(self.v, dict(self.a), list(self.x))
+        return AssignmentState(self.v, dict(self.a), list(self.x), self.c, self.t)
 
 
 def assign(state: AssignmentState, experiment_id: str, variant_id: str) -> None:
@@ -41,7 +45,10 @@ def mark_exposed(state: AssignmentState, experiment_id: str) -> bool:
 
 
 def state_json(state: AssignmentState) -> str:
-    return json.dumps({"v": state.v, "a": state.a, "x": state.x}, separators=(",", ":"), ensure_ascii=False)
+    data: Dict[str, Any] = {"v": state.v, "a": state.a, "x": state.x}
+    if state.c is not None and state.t is not None:
+        data["c"], data["t"] = state.c, state.t
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
 
 def sign_assignment(key: bytes, state: AssignmentState) -> str:
@@ -81,6 +88,9 @@ def _normalize_state(raw: Any) -> Optional[AssignmentState]:
     }
     raw_x = raw.get("x")
     x = [i for i in raw_x if isinstance(i, str) and i in a][:MAX_COOKIE_EXPERIMENTS] if isinstance(raw_x, list) else []
+    c, t = raw.get("c"), safe_int(raw.get("t"))
+    if isinstance(c, str) and COUNTRY_RE.fullmatch(c) and t is not None and t >= 0:
+        return AssignmentState(v, a, x, c, t)
     return AssignmentState(v, a, x)
 
 

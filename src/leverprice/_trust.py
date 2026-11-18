@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 
 from ._crypto import ed25519_verify
 from ._util import LeverpriceError, as_number, from_b64url, from_utf8, js_equals, json_loads, safe_int, sha256
-from ._wire import Config, parse_config
+from ._wire import Config, ConfigError, ConfigErrorCode, parse_config
 
 ROOT_KEY_PLACEHOLDER = "REPLACE_WITH_ROOT_PUBLIC_KEY"
 _KEYSET_CACHE_SIZE = 8
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -46,19 +48,21 @@ class TrustChain:
 
     def verify(self, envelope: Any, now: float) -> VerifiedConfig:
         if not isinstance(envelope, dict):
-            raise LeverpriceError("Leverprice config: response is not a signed config")
+            raise ConfigError("malformed", "Leverprice config: response is not a signed config")
         payload, signature, key_id = envelope.get("payload"), envelope.get("signature"), envelope.get("keyId")
         if not isinstance(payload, str) or not isinstance(signature, str) or not isinstance(key_id, str):
-            raise LeverpriceError("Leverprice config: response is not a signed config")
-        keyset = self._verify_keyset(envelope.get("keyset"), now)
+            raise ConfigError("malformed", "Leverprice config: response is not a signed config")
+        keyset = _coded("untrusted", lambda: self._verify_keyset(envelope.get("keyset"), now))
         key = next((k for k in keyset.keys if k.id == key_id), None)
         if key is None:
-            raise LeverpriceError(f'Leverprice config: signing key "{key_id}" is not in keyset v{keyset.version}')
+            message = f'Leverprice config: signing key "{key_id}" is not in keyset v{keyset.version}'
+            raise ConfigError("bad_signature", message)
         if not ed25519_verify(key.public_key, signature, payload):
-            raise LeverpriceError(f'Leverprice config: bad signature (key "{key_id}")')
-        config, dropped = parse_config(payload)
+            raise ConfigError("bad_signature", f'Leverprice config: bad signature (key "{key_id}")')
+        config, dropped = _coded("malformed", lambda: parse_config(payload))
         if now >= config.expires_at:
-            raise LeverpriceError(f"Leverprice config v{config.version}: expired at {_iso(config.expires_at)}")
+            message = f"Leverprice config v{config.version}: expired at {_iso(config.expires_at)}"
+            raise ConfigError("expired", message)
         return VerifiedConfig(config, key, dropped)
 
     def _verify_keyset(self, signed: Any, now: float) -> Keyset:
@@ -146,13 +150,24 @@ def accept_config(
     config = verified.config
     # A validly signed config of another project (e.g. from a compromised cache) is refused.
     if fingerprint not in config.key_fingerprints:
-        raise LeverpriceError("Leverprice config: not issued for this API key; refusing")
+        raise ConfigError("wrong_key", "Leverprice config: not issued for this API key; refusing")
     if current is not None and config.project_id != current.project_id:
-        raise LeverpriceError(
-            f"Leverprice config: project changed from {current.project_id} to {config.project_id}; refusing"
+        raise ConfigError(
+            "wrong_project",
+            f"Leverprice config: project changed from {current.project_id} to {config.project_id}; refusing",
         )
     if current is not None and config.version < current.version:
-        raise LeverpriceError(
-            f"Leverprice config: refusing to roll back from version {current.version} to {config.version}"
+        raise ConfigError(
+            "rollback",
+            f"Leverprice config: refusing to roll back from version {current.version} to {config.version}",
         )
     return verified
+
+
+def _coded(code: ConfigErrorCode, run: Callable[[], _T]) -> _T:
+    try:
+        return run()
+    except ConfigError:
+        raise
+    except Exception as err:
+        raise ConfigError(code, str(err)) from err

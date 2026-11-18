@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Generator, List, Mapping, NamedTuple, Optional, Set, Tuple, Union
+from urllib.parse import quote_from_bytes
 
 from ._bots import is_bot
 from ._cookie import (
@@ -27,7 +28,17 @@ from ._cookie import (
     sign_assignment,
     verify_assignment,
 )
-from ._request import RequestInfo, header_source, is_wsgi_environ, normalize_country, read_header, read_request, unwrap
+from ._request import (
+    RequestInfo,
+    client_address,
+    header_source,
+    is_wsgi_environ,
+    normalize_country,
+    read_header,
+    read_request,
+    unwrap,
+    visitor_set_header,
+)
 from ._transport import Transport, UrllibTransport
 from ._trust import SigningKey, TrustChain, accept_config, key_fingerprint
 from ._util import (
@@ -44,12 +55,16 @@ from ._util import (
     parse_header_int,
     safe_int,
     sha256,
+    utf8,
 )
 from ._version import SDK_VERSION
 from ._wire import (
     CONFIG_VERSION_HEADER,
     MAX_EVENTS_PER_REQUEST,
+    STANDARD_LEVEL,
     Config,
+    ConfigError,
+    ConfigErrorCode,
     ConfigExperiment,
     ConfigProduct,
     ConfigVariant,
@@ -73,6 +88,9 @@ MAX_BACKOFF_MS = 30_000
 CATCH_UP_GAP_MS = 5_000
 MAX_DEDUPE = 10_000
 EXIT_FLUSH_TIMEOUT_MS = 2_000
+PRODUCTS_HEADER = "Leverprice-Products"
+CONFIG_ERROR_HEADER = "Leverprice-Config-Error"
+MAX_REPORTED_PRODUCTS = 50
 
 _KEY_RE = re.compile(r"pp_sk_(live|test)_[0-9A-Za-z]{40}")
 _COOKIE_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
@@ -155,6 +173,15 @@ class _ScopeCookie(NamedTuple):
     state: AssignmentState
 
 
+@dataclass
+class _Visitor:
+    key: bytes
+    user_id: Optional[str]
+    state: AssignmentState
+    changed: bool
+    """The state differs from the request's cookie: send a new one."""
+
+
 class _Context(NamedTuple):
     request: Any
     cookie: Any
@@ -207,10 +234,11 @@ class _ScopeMap:
 
 
 class _Flight:
-    __slots__ = ("_lock", "_waiters", "done", "started_at")
+    __slots__ = ("_lock", "_waiters", "done", "slow_reported", "started_at")
 
     def __init__(self, started_at: int) -> None:
         self.started_at = started_at
+        self.slow_reported = False
         self.done = threading.Event()
         self._lock = threading.Lock()
         self._waiters: List[Tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
@@ -282,7 +310,9 @@ class Leverprice:
         self._cookie_max_age = max_age
         self._cookie_secure = bool(cookie_secure)
         self._cookie_domain = cookie_domain or None
-        self._country_header = _header_name(country_header)
+        named_header = _header_name(country_header)
+        # A header the visitor sends would let them pick their own price: the project's setting is used.
+        self._country_header = None if named_header is not None and visitor_set_header(named_header) else named_header
         self._local_currencies = local_currencies is True
         self._transport = _transport_callable(transport)
         if on_error is not None and not callable(on_error):
@@ -293,6 +323,7 @@ class Leverprice:
         key = js_trim(secret_key) if isinstance(secret_key, str) else ""
         self._secret_key: Optional[str] = key if _KEY_RE.fullmatch(key) else None
         self._fingerprint = key_fingerprint(self._secret_key) if self._secret_key else ""
+        self._products_header = _products_header(self._guards)
 
         self._clock: Callable[[], int] = now_ms
         self._request_timeout_ms = REQUEST_TIMEOUT_MS
@@ -302,6 +333,7 @@ class Leverprice:
         self._token = object()
 
         self._config: Optional[Config] = None
+        self._config_error: Optional[ConfigErrorCode] = None
         self._signing_key: Optional[SigningKey] = None
         self._etag: Optional[str] = None
         self._fetched_at = 0
@@ -314,10 +346,19 @@ class Leverprice:
         self._reset_runtime()
         _clients.add(self)
 
-        if key and self._secret_key is None and not self._disabled and not _env_disabled():
+        quiet = self._disabled or _env_disabled()
+        if key and self._secret_key is None and not quiet:
             self._emit(
                 LeverpriceError(
                     "Leverprice: secret_key is not a pp_sk_live_… / pp_sk_test_… key; serving fallback prices."
+                )
+            )
+        if named_header is not None and self._country_header is None and not quiet:
+            self._emit(
+                LeverpriceError(
+                    f'Leverprice: country_header "{named_header}" is sent by visitors\' browsers, so it would let '
+                    "them pick their own price; it is ignored. Name the header your CDN or host sets, such as "
+                    "cf-ipcountry."
                 )
             )
 
@@ -639,18 +680,33 @@ class Leverprice:
                 return _fallback(product_key, guard, "unknown_product")
             if product.currency != guard.currency:
                 return _fallback(product_key, guard, "currency_mismatch")
-            exp = _experiment_for(product, req.country)
+            # The country a visitor holds lives in the cookie, so it is read before the test is chosen.
+            held: Optional[_Visitor] = None
+            country = req.country
+            if config.country_hold > 0 and product.regions:
+                held = self._visitor(ctx, req, source, scope, config)
+                country = self._held_country(held, guard, product, req.country, config.country_hold)
+            exp = _experiment_for(product, country)
             if exp is None:
                 if not _in_range(product, product.price):
                     return _fallback(product_key, guard, "out_of_bounds")
-                region = self._region_for(guard, product, req.country)
+                region = self._region_for(guard, product, country)
                 if region is not None:
-                    return _regional_quote(product_key, region, req.country)
-                return _price_quote(product_key, guard, product.price, "base_price", product.checkout_url, req.country)
+                    quote = _regional_quote(product_key, region, country)
+                else:
+                    quote = _price_quote(product_key, guard, product.price, "base_price", product.checkout_url, country)
+                if held is not None:
+                    cookies = self._keep(held, scope, req, config)
+                    # Outside a test the cookie only carries the held country: none held, none sent.
+                    quote.set_cookie = cookies if held.state.c is not None else []
+                return quote
             if not exp.variants or not all(_in_range(product, v.price) for v in exp.variants):
                 return _fallback(product_key, guard, "out_of_bounds")
-            region = self._region_for(guard, product, req.country)
-            return self._experiment_quote(product_key, guard, ctx, req, scope, config, product, exp, region)
+            visitor = held if held is not None else self._visitor(ctx, req, source, scope, config)
+            region = self._region_for(guard, product, country)
+            return self._experiment_quote(
+                product_key, guard, ctx, req, scope, config, product, exp, region, country, visitor
+            )
         except Exception as err:
             self._report(err)
             return _fallback(product_key, guard, "bot") if bot else self._no_config(product_key, guard, scope)
@@ -677,60 +733,33 @@ class Leverprice:
         product: ConfigProduct,
         exp: ConfigExperiment,
         region: Optional[_Region],
+        country: Optional[str],
+        visitor: _Visitor,
     ) -> Quote:
-        key = self._hmac_key(config.assignment_key)
-        user_id = _normalize_user_id(ctx.user_id)
-        prior = scope.cookie if scope is not None else None
-        state: Optional[AssignmentState] = None
-        if (
-            prior is not None
-            and prior.input == req.cookie_input
-            and prior.user_id == user_id
-            and prior.assignment_key == config.assignment_key
-        ):
-            state = prior.state.clone()
-        else:
-            for raw in req.assignment_cookies[:4]:
-                state = verify_assignment(key, raw)
-                if state is not None:
-                    break
-        changed = False
-        if state is None:
-            state = AssignmentState(secrets.token_hex(16))
-            changed = True
-
+        key, user_id, state = visitor.key, visitor.user_id, visitor.state
         visitor_key = f"u:{user_id}" if user_id is not None else f"a:{state.v}"
         visitor_id = hmac_hex(key, "pp:visitor:v1:" + visitor_key, 32)
 
         assigned = state.a.get(exp.id)
         sticky = next((v for v in exp.variants if v.id == assigned), None) if assigned is not None else None
         if sticky is None:
-            weights = None if req.country is None else exp.split_of.get(req.country)
+            weights = None if country is None else exp.split_of.get(country)
             variant = _pick_variant(exp.variants, _bucket(exp.salt, visitor_id), weights)
             assign(state, exp.id, variant.id)
-            changed = True
+            visitor.changed = True
         else:
             variant = sticky
 
         with self._queue_lock:
             logged = exp.id in state.x or f"{exp.id}:{visitor_id}" in self._exposed
         if not logged and ctx.auto_exposure and not req.prefetch:
-            self._record_exposure(exp.id, variant.id, visitor_id, req.country)
+            self._record_exposure(exp.id, variant.id, visitor_id, country)
             logged = True
         if logged and mark_exposed(state, exp.id):
-            changed = True
+            visitor.changed = True
 
-        if scope is not None:
-            scope.cookie = _ScopeCookie(req.cookie_input, user_id, config.assignment_key, state)
+        set_cookie = self._keep(visitor, scope, req, config)
         signature = hmac_hex(key, f"pp:attr:v1:{exp.id}:{variant.id}:{visitor_id}", 16)
-        set_cookie = []
-        if changed:
-            value = sign_assignment(key, state)
-            set_cookie.append(
-                set_cookie_header(
-                    self._cookie_name, value, self._cookie_max_age, self._cookie_secure, self._cookie_domain
-                )
-            )
         if region is None:
             price, currency, checkout_url = variant.price, guard.currency, variant.checkout_url or product.checkout_url
         else:
@@ -748,9 +777,69 @@ class Leverprice:
             set_cookie=set_cookie,
             checkout_url=checkout_url,
             exposure_logged=logged,
-            country=req.country,
+            country=country,
             regional=region is not None,
         )
+
+    def _visitor(
+        self, ctx: _Context, req: RequestInfo, source: Any, scope: Optional[_Scope], config: Config
+    ) -> _Visitor:
+        """The state an earlier quote of the same request left, else the first valid cookie, else a new visitor."""
+        key = self._hmac_key(config.assignment_key)
+        user_id = _normalize_user_id(ctx.user_id)
+        prior = scope.cookie if scope is not None else None
+        state: Optional[AssignmentState] = None
+        if (
+            prior is not None
+            and prior.input == req.cookie_input
+            and prior.user_id == user_id
+            and prior.assignment_key == config.assignment_key
+        ):
+            state = prior.state.clone()
+        else:
+            for raw in req.assignment_cookies[:4]:
+                state = verify_assignment(key, raw)
+                if state is not None:
+                    break
+        if state is not None:
+            return _Visitor(key, user_id, state, False)
+        return _Visitor(key, user_id, AssignmentState(_new_visitor_key(key, ctx, req, source)), True)
+
+    def _held_country(
+        self, visitor: _Visitor, guard: _Guard, product: ConfigProduct, country: Optional[str], hold_seconds: int
+    ) -> Optional[str]:
+        """The country whose price the visitor gets: a dearer country they were seen in lately (VPN guard), or
+        the country they are in, which is then held.
+        """
+        now = self._clock() // 1000
+        state = visitor.state
+        held = state.c if state.c is not None and state.t is not None and now - state.t < hold_seconds else None
+        if (
+            held is not None
+            and held != country
+            and self._level_of(guard, product, held) > self._level_of(guard, product, country)
+        ):
+            return held
+        if country is not None and held != country:
+            state.c, state.t = country, now
+            visitor.changed = True
+        return country
+
+    def _level_of(self, guard: _Guard, product: ConfigProduct, country: Optional[str]) -> int:
+        """What a visitor from ``country`` pays, as basis points of the standard price."""
+        region = self._region_for(guard, product, country)
+        return product.regions[region.index].level if region is not None else STANDARD_LEVEL
+
+    def _keep(self, visitor: _Visitor, scope: Optional[_Scope], req: RequestInfo, config: Config) -> List[str]:
+        """Remembers the visitor for the request's next quote; the Set-Cookie values when it changed."""
+        if scope is not None:
+            scope.cookie = _ScopeCookie(req.cookie_input, visitor.user_id, config.assignment_key, visitor.state)
+        if not visitor.changed:
+            return []
+        value = sign_assignment(visitor.key, visitor.state)
+        return [
+            set_cookie_header(self._cookie_name, value, self._cookie_max_age, self._cookie_secure, self._cookie_domain)
+        ]
 
     def _bot_quote(self, product_key: str, guard: _Guard, config: Optional[Config]) -> Quote:
         product = config.products.get(product_key) if config is not None else None
@@ -796,10 +885,11 @@ class Leverprice:
         if flight is None:
             # The fetch started by the kick may already have finished.
             return self._usable(self._clock())
-        remaining = self._timeout_ms - (now - flight.started_at)
-        if remaining > 0:
-            flight.done.wait(remaining / 1000)
-        return self._usable(self._clock())
+        # Each request waits its own timeout_ms: a fetch started earlier (preload(), another
+        # request) must not shorten it.
+        if self._timeout_ms > 0:
+            flight.done.wait(self._timeout_ms / 1000)
+        return self._after_wait(flight)
 
     async def _current_config_async(self) -> Optional[Config]:
         now = self._clock()
@@ -810,10 +900,30 @@ class Leverprice:
         flight = self._live_flight(now)
         if flight is None:
             return self._usable(self._clock())
-        remaining = self._timeout_ms - (now - flight.started_at)
-        if remaining > 0:
-            await flight.wait_async(remaining / 1000)
-        return self._usable(self._clock())
+        if self._timeout_ms > 0:
+            await flight.wait_async(self._timeout_ms / 1000)
+        return self._after_wait(flight)
+
+    def _after_wait(self, flight: _Flight) -> Optional[Config]:
+        with self._lock:
+            config = self._usable_locked(self._clock())
+            slow = (
+                config is None
+                and self._timeout_ms > 0
+                and self._inflight is flight
+                and not flight.done.is_set()
+                and not flight.slow_reported
+            )
+            if slow:
+                flight.slow_reported = True
+        if slow:
+            self._report(
+                LeverpriceError(
+                    f"Leverprice config: still loading after {self._timeout_ms:.0f} ms (timeout_ms); "
+                    "serving fallback prices until it arrives"
+                )
+            )
+        return config
 
     def _live_flight_locked(self, now: int) -> Optional[_Flight]:
         flight = self._inflight
@@ -869,8 +979,12 @@ class Leverprice:
 
     def _load_config(self, unconditional: bool) -> None:
         try:
-            headers: Dict[str, str] = {}
+            # Tells the dashboard whether visitors get real prices: the products in code, and why the last
+            # config was refused.
+            headers: Dict[str, str] = {PRODUCTS_HEADER: self._products_header}
             with self._lock:
+                if self._config_error is not None:
+                    headers[CONFIG_ERROR_HEADER] = self._config_error
                 # Revalidate only a config that is still usable; an expired or revoked one needs a new body.
                 if not unconditional and self._etag and self._usable_locked(self._clock()) is not None:
                     headers["If-None-Match"] = self._etag
@@ -884,7 +998,7 @@ class Leverprice:
                 try:
                     envelope = json_loads(res.text)
                 except Exception:
-                    raise LeverpriceError("Leverprice config: response is not JSON") from None
+                    raise ConfigError("malformed", "Leverprice config: response is not JSON") from None
                 self._accept(envelope, res.headers.get("etag"))
             with self._lock:
                 self._failures = 0
@@ -892,6 +1006,8 @@ class Leverprice:
             self._note_server_version(res.headers)
         except Exception as err:
             with self._lock:
+                if isinstance(err, ConfigError):
+                    self._config_error = err.code
                 self._failures += 1
                 self._retry_at = self._clock() + min(MAX_BACKOFF_MS, 500 * 2 ** min(self._failures, 16))
             self._report(err)
@@ -908,6 +1024,7 @@ class Leverprice:
                 notice = f"Leverprice config v{config.version}: ignored malformed products {dropped}"
             with self._lock:
                 self._config = config
+                self._config_error = None
                 self._signing_key = verified.signing_key
                 self._etag = etag
                 self._fetched_at = self._clock()
@@ -1194,6 +1311,24 @@ def _normalize_guards(products: Any) -> Dict[str, _Guard]:
             raise ValueError(f"{where}.fallback_price must be a positive integer (minor units)")
         guards[key] = _Guard(currency.lower(), fallback)
     return guards
+
+
+def _products_header(guards: Mapping[str, _Guard]) -> str:
+    """``key=currency`` per product, sorted by key, keys percent-encoded byte by byte in UTF-8, at most 50."""
+    entries = [(quote_from_bytes(utf8(key), safe=""), g.currency) for key, g in guards.items()]
+    entries.sort(key=lambda entry: entry[0])
+    return ", ".join(f"{key}={currency}" for key, currency in entries[:MAX_REPORTED_PRODUCTS])
+
+
+def _new_visitor_key(key: bytes, ctx: _Context, req: RequestInfo, source: Any) -> str:
+    """A new visitor's key: a keyed hash of address, browser and languages, so a visitor who refuses cookies
+    keeps one price and counts once. Neither the address nor the browser leaves the server. No address: random.
+    """
+    address = client_address(source, ctx.request)
+    if address is None:
+        return secrets.token_hex(16)
+    language = read_header(source, "accept-language") or ""
+    return hmac_hex(key, f"pp:anon:v1:{address}\n{req.user_agent or ''}\n{language}", 32)
 
 
 def _header_name(value: Any) -> Optional[str]:
