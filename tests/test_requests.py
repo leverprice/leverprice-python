@@ -8,7 +8,7 @@ import pytest
 
 from _support import CHROME, GOOGLEBOT, FakeServer, Headers, SigningKeys, config_payload, make_client
 from leverprice import Leverprice, Quote, apply_cookies
-from leverprice._request import header_source, read_header, read_request
+from leverprice._request import header_source, normalize_country, read_header, read_request, unwrap
 
 KEYS = SigningKeys()
 COOKIE = "__pp=abc.def; theme=dark"
@@ -67,6 +67,10 @@ def info(request: Any) -> Tuple[Optional[str], Optional[str], bool]:
     return req.cookie_input, req.user_agent, req.prefetch
 
 
+def country_of(request: Any, header: Optional[str] = "cf-ipcountry", passed: Any = None) -> Optional[str]:
+    return read_request(header_source(unwrap(request)), None, None, "__pp", passed, header).country
+
+
 EXPECTED = (COOKIE, CHROME, True)
 
 
@@ -76,6 +80,7 @@ EXPECTED = (COOKIE, CHROME, True)
         {"Cookie": COOKIE, "User-Agent": CHROME, "Sec-Purpose": "prefetch"},
         {"COOKIE": [COOKIE], "user-agent": CHROME, "x-moz": "prefetch"},
         {"HTTP_COOKIE": COOKIE, "HTTP_USER_AGENT": CHROME, "HTTP_PURPOSE": "prefetch", "REQUEST_METHOD": "GET"},
+        {"HTTP_COOKIE": COOKIE, "HTTP_USER_AGENT": CHROME, "HTTP_X_SEC_PURPOSE": "prefetch", "REQUEST_METHOD": "GET"},
         Headers({"cookie": COOKIE, "user-agent": CHROME, "x-purpose": "preview"}),
         Headers(CaseInsensitive({"Cookie": COOKIE, "User-Agent": CHROME, "Next-Router-Prefetch": "1"})),
         DjangoLike({"HTTP_COOKIE": COOKIE, "HTTP_USER_AGENT": CHROME, "HTTP_SEC_PURPOSE": "prefetch"}),
@@ -86,11 +91,9 @@ EXPECTED = (COOKIE, CHROME, True)
             "headers": [(b"cookie", COOKIE.encode()), (b"user-agent", CHROME.encode()), (b"sec-purpose", b"prefetch")],
         },
     ],
-    ids=["dict", "dict-list", "environ", "headers", "ci-mapping", "meta", "proxy", "pairs", "asgi-scope"],
+    ids=["dict", "dict-list", "environ", "turbo", "headers", "ci-mapping", "meta", "proxy", "pairs", "asgi-scope"],
 )
 def test_request_shapes(request_obj: Any) -> None:
-    from leverprice._request import unwrap
-
     assert info(unwrap(request_obj)) == EXPECTED
 
 
@@ -117,6 +120,63 @@ def test_missing_and_odd_requests() -> None:
         assert info(request) == (None, None, False)
 
 
+@pytest.mark.parametrize(
+    "request_obj",
+    [
+        {"CF-IPCountry": "br"},
+        {"HTTP_CF_IPCOUNTRY": "br", "REQUEST_METHOD": "GET"},
+        Headers(CaseInsensitive({"CF-IPCountry": "br"})),
+        DjangoLike({"HTTP_CF_IPCOUNTRY": "br"}),
+        Proxy(Headers({"cf-ipcountry": "br"})),
+        [("CF-IPCountry", "br")],
+        {"type": "http", "headers": [(b"cf-ipcountry", b"br")]},
+    ],
+    ids=["dict", "environ", "ci-mapping", "meta", "proxy", "pairs", "asgi-scope"],
+)
+def test_country_header_shapes(request_obj: Any) -> None:
+    assert country_of(request_obj, None) is None
+    assert country_of(request_obj) == "BR"
+
+
+def test_normalize_country() -> None:
+    assert [normalize_country(v) for v in ("US", "br", " de ", "\tin\r\n")] == ["US", "BR", "DE", "IN"]
+    for value in (None, 42, b"US", ["US"], {"country": "US"}):
+        assert normalize_country(value) is None
+    for value in ("xx", " eu ", "Ap", "zZ", "usa", "u", ""):
+        assert normalize_country(value) is None
+    for value in ("\u00df", "\u0131n", "\ufb01", "\u017fe", "\u212aR", "\uff35\uff33"):
+        assert normalize_country(value) is None
+    for value in ("\u00a0US", "US\u0085", "\x1cUS", "\ufeffUS", "US\x00", "us\nde"):
+        assert normalize_country(value) is None
+
+
+def test_header_names_are_matched_as_ascii() -> None:
+    headers = {"X-\u212aountry": "IN", "\u017fec-purpose": "prefetch", "X-COUNTRY": "BR"}
+    assert "X-\u212aountry".lower() == "x-kountry"
+    for source in (headers, list(headers.items()), Headers(headers)):
+        assert read_header(header_source(source), "x-kountry") is None
+        assert read_header(header_source(source), "sec-purpose") is None
+        assert read_header(header_source(source), "x-country") == "BR"
+    environ = {"HTTP_X_\u212aOUNTRY": "IN", "http_x_country": "BR", "wsgi.version": (1, 0)}
+    assert read_header(environ, "x-kountry") is None
+    assert read_header(environ, "x-country") == "BR"
+
+
+def test_country_comes_only_from_the_named_header_or_the_caller() -> None:
+    request = {"cf-ipcountry": "br", "x-vercel-ip-country": "IN"}
+    assert country_of(request, None) is None
+    assert country_of(request) == "BR"
+    assert country_of(request, "x-vercel-ip-country") == "IN"
+    assert country_of(request, passed="de") == "DE"
+    assert country_of(request, passed="nowhere") is None
+    assert country_of(request, passed=b"DE") == "BR"
+    assert country_of({"cf-ipcountry": "XX"}) is None
+    assert country_of({"cf-ipcountry": "T1"}) is None
+    assert country_of({"cf-ipcountry": ["BR", "IN"]}) is None
+    assert country_of(None, passed="IN") == "IN"
+    assert country_of(None) is None
+
+
 def test_explicit_values_win(lp: Leverprice) -> None:
     request = {"cookie": "__pp_f=1", "user-agent": GOOGLEBOT}
     assert lp.get_price("pro", request).reason == "bot"
@@ -134,12 +194,19 @@ def test_django_request(lp: Leverprice) -> None:
     from django.http import HttpResponse
     from django.test import RequestFactory
 
-    request = RequestFactory().get("/", HTTP_USER_AGENT=CHROME, HTTP_COOKIE="theme=dark", HTTP_SEC_PURPOSE="prefetch")
+    request = RequestFactory().get(
+        "/",
+        HTTP_USER_AGENT=CHROME,
+        HTTP_COOKIE="theme=dark",
+        HTTP_SEC_PURPOSE="prefetch",
+        HTTP_CF_IPCOUNTRY="in",
+    )
     pro = lp.get_price("pro", request)
     team = lp.get_price("team", request)
     assert pro.reason == "experiment"
     assert not pro.exposure_logged
     assert pro.visitor_id == team.visitor_id
+    assert country_of(request) == "IN"
     response = apply_cookies(HttpResponse("ok"), team)
     header = response.cookies["__pp"].output(header="Set-Cookie:")
     for part in ("Max-Age=15552000", "Path=/", "SameSite=Lax", "HttpOnly", "Secure"):
@@ -149,10 +216,12 @@ def test_django_request(lp: Leverprice) -> None:
 def test_flask_request(lp: Leverprice) -> None:
     flask = pytest.importorskip("flask")
     app = flask.Flask(__name__)
-    with app.test_request_context("/", headers={"User-Agent": CHROME, "Cookie": "theme=dark"}):
+    headers = {"User-Agent": CHROME, "Cookie": "theme=dark", "CF-IPCountry": "in"}
+    with app.test_request_context("/", headers=headers):
         pro = lp.get_price("pro", flask.request)
         team = lp.get_price("team", flask.request)
         assert pro.visitor_id == team.visitor_id
+        assert country_of(flask.request) == "IN"
         response = apply_cookies(flask.make_response("ok"), team)
         assert response.headers.getlist("Set-Cookie") == team.set_cookie
     with app.test_request_context("/", headers={"User-Agent": CHROME}):
@@ -168,10 +237,16 @@ def test_starlette_request(lp: Leverprice) -> None:
         "type": "http",
         "method": "GET",
         "path": "/",
-        "headers": [(b"user-agent", CHROME.encode()), (b"cookie", b"a=1"), (b"cookie", b"__pp_f=1")],
+        "headers": [
+            (b"user-agent", CHROME.encode()),
+            (b"cookie", b"a=1"),
+            (b"cookie", b"__pp_f=1"),
+            (b"cf-ipcountry", b"in"),
+        ],
     }
     request = Request(scope)
     assert lp.get_price("pro", request).reason == "pinned_fallback"
+    assert country_of(request) == "IN"
     fresh = Request({**scope, "headers": scope["headers"][:1]})
     quote = lp.get_price("pro", fresh)
     response = apply_cookies(Response("ok"), quote)
@@ -180,8 +255,10 @@ def test_starlette_request(lp: Leverprice) -> None:
 
 def test_multidict_headers(lp: Leverprice) -> None:
     multidict = pytest.importorskip("multidict")
-    headers = multidict.CIMultiDict([("User-Agent", CHROME), ("Cookie", "a=1"), ("Cookie", "__pp_f=1")])
+    pairs = [("User-Agent", CHROME), ("Cookie", "a=1"), ("Cookie", "__pp_f=1"), ("CF-IPCountry", "in")]
+    headers = multidict.CIMultiDict(pairs)
     assert lp.get_price("pro", Headers(headers)).reason == "pinned_fallback"  # type: ignore[arg-type]
+    assert country_of(Headers(headers)) == "IN"  # type: ignore[arg-type]
 
     class AiohttpResponse:
         def __init__(self) -> None:

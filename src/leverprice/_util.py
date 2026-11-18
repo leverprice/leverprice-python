@@ -14,8 +14,10 @@ from typing import Any, Optional
 MAX_SAFE_INTEGER = 2**53 - 1
 
 JS_WHITESPACE = "\t\n\x0b\x0c\r                  　﻿"
+ASCII_WHITESPACE = " \t\n\x0b\x0c\r"
 
 ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+COUNTRY_RE = re.compile(r"[A-Z]{2}")
 _B64URL_RE = re.compile(r"[A-Za-z0-9_-]*")
 _HEX = frozenset("0123456789abcdefABCDEF")
 _DIGITS_RE = re.compile(r"[0-9]+")

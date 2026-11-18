@@ -10,7 +10,7 @@ from leverprice import Leverprice, LeverpriceError, is_bot
 from leverprice._client import _bucket, _pick_variant
 from leverprice._cookie import AssignmentState, assign, mark_exposed, set_cookie_header, sign_assignment, state_json
 from leverprice._cookie import verify_assignment as verify_cookie
-from leverprice._request import cookie_values, is_prefetch
+from leverprice._request import cookie_values, is_prefetch, normalize_country
 from leverprice._trust import TrustChain, accept_config, key_fingerprint
 from leverprice._util import from_b64url, hmac_hex
 from leverprice._wire import Config, ConfigVariant, event_problem
@@ -73,6 +73,8 @@ def test_buckets(case: Dict[str, Any]) -> None:
 def test_pick_variant(case: Dict[str, Any]) -> None:
     variants = tuple(ConfigVariant(f"v{i}", 100, w) for i, w in enumerate(case["weights"]))
     assert variants.index(_pick_variant(variants, case["bucket"])) == case["index"]
+    unweighted = tuple(ConfigVariant(v.id, v.price, 0) for v in variants)
+    assert unweighted.index(_pick_variant(unweighted, case["bucket"], tuple(case["weights"]))) == case["index"]
 
 
 @pytest.mark.parametrize("case", VECTORS["cookies"]["sign"], ids=lambda c: c["json"])
@@ -116,6 +118,11 @@ def test_set_cookie(case: Dict[str, Any]) -> None:
     assert header == case["header"]
 
 
+@pytest.mark.parametrize("case", VECTORS["countries"], ids=lambda c: repr(c["value"]))
+def test_countries(case: Dict[str, Any]) -> None:
+    assert normalize_country(case["value"]) == case["country"]
+
+
 @pytest.mark.parametrize("case", VECTORS["bots"], ids=lambda c: c["userAgent"][:60])
 def test_bots(case: Dict[str, Any]) -> None:
     assert is_bot(case["userAgent"]) is case["bot"]
@@ -129,6 +136,8 @@ def test_events(case: Dict[str, Any]) -> None:
 _QUOTE_FIELDS = {
     "price": "price",
     "currency": "currency",
+    "country": "country",
+    "regional": "regional",
     "isFallback": "is_fallback",
     "reason": "reason",
     "experimentId": "experiment_id",
@@ -154,26 +163,30 @@ def test_quotes(case: Dict[str, Any], form: str, ed25519_backend: str) -> None:
         transport=server,
         on_error=errors.append,
         timeout_ms=10_000,
+        country_header=case.get("countryHeader"),
+        local_currencies=case.get("localCurrencies", False),
     )
     request: Any = dict(case["headers"]) if form == "dict" else Headers(dict(case["headers"]))
     options: Dict[str, Any] = {"user_id": case["userId"]}
-    if "exposure" in case:
-        options["exposure"] = case["exposure"]
-    if "bot" in case:
-        options["bot"] = case["bot"]
+    for name in ("exposure", "bot", "country"):
+        if name in case:
+            options[name] = case[name]
     quote = lp.get_price(case["productKey"], request, **options)
     lp.flush()
 
     expect = case["expect"]
     assert quote.product_key == case["productKey"]
+    assert set(expect) == {*_QUOTE_FIELDS, "exposures"}
     for wire, attr in _QUOTE_FIELDS.items():
         assert getattr(quote, attr) == expect[wire], attr
     sent = [{k: v for k, v in e.items() if k != "timestamp"} for e in server.events]
     assert sent == expect["exposures"]
-    assert [str(e) for e in errors if "malformed products" not in str(e)] == []
+    assert [str(e) for e in errors if "malformed products" not in str(e)] == case["errors"]
     lp.close()
 
 
+_SNAKE = {"fallbackPrice": "fallback_price", "minPrice": "min_price", "maxPrice": "max_price"}
+
+
 def _snake_guard(guard: Dict[str, Any]) -> Dict[str, Any]:
-    names = {"fallbackPrice": "fallback_price", "minPrice": "min_price", "maxPrice": "max_price"}
-    return {names.get(k, k): v for k, v in guard.items()}
+    return {_SNAKE.get(k, k): v for k, v in guard.items()}

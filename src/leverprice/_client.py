@@ -12,7 +12,7 @@ import secrets
 import threading
 import uuid
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Generator, List, Mapping, NamedTuple, Optional, Set, Tuple, Union
@@ -27,10 +27,11 @@ from ._cookie import (
     sign_assignment,
     verify_assignment,
 )
-from ._request import RequestInfo, header_source, is_wsgi_environ, read_request, unwrap
+from ._request import RequestInfo, header_source, is_wsgi_environ, normalize_country, read_header, read_request, unwrap
 from ._transport import Transport, UrllibTransport
 from ._trust import SigningKey, TrustChain, accept_config, key_fingerprint
 from ._util import (
+    ASCII_WHITESPACE,
     MAX_SAFE_INTEGER,
     LeverpriceError,
     from_b64url,
@@ -75,9 +76,11 @@ EXIT_FLUSH_TIMEOUT_MS = 2_000
 
 _KEY_RE = re.compile(r"pp_sk_(live|test)_[0-9A-Za-z]{40}")
 _COOKIE_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_HEADER_NAME_RE = _COOKIE_NAME_RE
 _CURRENCY_RE = re.compile(r"[A-Za-z]{3}")
 _SIG_RE = re.compile(r"[0-9a-f]{16}")
-_GUARD_FIELDS = ("currency", "fallback_price", "min_price", "max_price")
+_GUARD_FIELDS = ("currency", "fallback_price")
+_DEPRECATED_GUARD_FIELDS = ("min_price", "max_price")
 
 _logger = logging.getLogger("leverprice")
 
@@ -87,12 +90,17 @@ QuoteSteps = Generator[None, Optional[Config], "Quote"]
 
 @dataclass(frozen=True)
 class ProductGuard:
-    """Local guardrails for one product, in minor units. Prices outside them are never returned."""
+    """One product's currency and fallback price, in minor units.
+
+    ``min_price`` and ``max_price`` are deprecated, ignored since 0.4: the price range is set in Leverprice.
+    """
 
     currency: str
     fallback_price: int
     min_price: Optional[int] = None
+    """Deprecated. Ignored since 0.4: the price range is set in Leverprice."""
     max_price: Optional[int] = None
+    """Deprecated. Ignored since 0.4: the price range is set in Leverprice."""
 
 
 @dataclass
@@ -111,6 +119,8 @@ class Quote:
     set_cookie: List[str] = field(default_factory=list)
     checkout_url: Optional[str] = None
     exposure_logged: bool = False
+    country: Optional[str] = None
+    regional: bool = False
 
 
 class UnknownProductError(LeverpriceError, KeyError):
@@ -123,8 +133,13 @@ class UnknownProductError(LeverpriceError, KeyError):
 class _Guard(NamedTuple):
     currency: str
     fallback_price: int
-    min_price: int
-    max_price: int
+
+
+@dataclass(frozen=True)
+class _Region:
+    index: int
+    currency: str
+    price: int
 
 
 class _Response(NamedTuple):
@@ -147,6 +162,7 @@ class _Context(NamedTuple):
     user_id: Any
     auto_exposure: bool
     bot: Any
+    country: Any
 
 
 class _Scope:
@@ -243,6 +259,8 @@ class Leverprice:
         cookie_max_age_seconds: int = 15_552_000,
         cookie_secure: bool = True,
         cookie_domain: Optional[str] = None,
+        country_header: Optional[str] = None,
+        local_currencies: bool = False,
         flush_interval_ms: float = 2_000,
         trusted_root_keys: Optional[Mapping[str, str]] = None,
         transport: Union[Transport, Callable[..., Any], None] = None,
@@ -264,6 +282,8 @@ class Leverprice:
         self._cookie_max_age = max_age
         self._cookie_secure = bool(cookie_secure)
         self._cookie_domain = cookie_domain or None
+        self._country_header = _header_name(country_header)
+        self._local_currencies = local_currencies is True
         self._transport = _transport_callable(transport)
         if on_error is not None and not callable(on_error):
             raise TypeError("Leverprice: on_error must be callable")
@@ -327,6 +347,7 @@ class Leverprice:
         user_id: Union[str, int, uuid.UUID, None] = None,
         exposure: str = "auto",
         bot: Optional[bool] = None,
+        country: Optional[str] = None,
     ) -> Quote:
         """Returns the price for ``product_key``.
 
@@ -336,7 +357,7 @@ class Leverprice:
         if self._is_off():
             return _fallback(product_key, guard, "disabled")
         self._check_fork()
-        ctx, scope = self._context(request, cookie, user_agent, user_id, exposure, bot)
+        ctx, scope = self._context(request, cookie, user_agent, user_id, exposure, bot, country)
         if scope is None:
             return self._run(self._quote_steps(product_key, guard, ctx, None))
         with scope.lock:
@@ -352,13 +373,14 @@ class Leverprice:
         user_id: Union[str, int, uuid.UUID, None] = None,
         exposure: str = "auto",
         bot: Optional[bool] = None,
+        country: Optional[str] = None,
     ) -> Quote:
         """Async ``get_price``: waiting for a config never blocks the event loop."""
         guard = self._guard(product_key)
         if self._is_off():
             return _fallback(product_key, guard, "disabled")
         self._check_fork()
-        ctx, scope = self._context(request, cookie, user_agent, user_id, exposure, bot)
+        ctx, scope = self._context(request, cookie, user_agent, user_id, exposure, bot, country)
         if scope is None:
             return await self._run_async(self._quote_steps(product_key, guard, ctx, None))
         async with scope.async_lock():
@@ -372,7 +394,8 @@ class Leverprice:
             self._check_fork()
             if not quote.experiment_id or not quote.variant_id or not quote.visitor_id:
                 return False
-            queued = self._record_exposure(quote.experiment_id, quote.variant_id, quote.visitor_id)
+            country = normalize_country(getattr(quote, "country", None))
+            queued = self._record_exposure(quote.experiment_id, quote.variant_id, quote.visitor_id, country)
             quote.exposure_logged = True
             return queued
         except Exception as err:
@@ -540,7 +563,7 @@ class Leverprice:
         return guard
 
     def _context(
-        self, request: Any, cookie: Any, user_agent: Any, user_id: Any, exposure: Any, bot: Any
+        self, request: Any, cookie: Any, user_agent: Any, user_id: Any, exposure: Any, bot: Any, country: Any
     ) -> Tuple[_Context, Optional[_Scope]]:
         scope: Optional[_Scope] = None
         try:
@@ -557,7 +580,7 @@ class Leverprice:
         except Exception:
             scope = None
         auto = exposure is None or exposure == "auto"
-        return _Context(request, cookie, user_agent, user_id, auto, bot), scope
+        return _Context(request, cookie, user_agent, user_id, auto, bot, country), scope
 
     def _run(self, steps: QuoteSteps) -> Quote:
         config: Optional[Config] = None
@@ -590,7 +613,15 @@ class Leverprice:
     def _quote_steps(self, product_key: str, guard: _Guard, ctx: _Context, scope: Optional[_Scope]) -> QuoteSteps:
         bot = False
         try:
-            req = read_request(header_source(ctx.request), ctx.cookie, ctx.user_agent, self._cookie_name)
+            source = header_source(ctx.request)
+            req = read_request(
+                source,
+                ctx.cookie,
+                ctx.user_agent,
+                self._cookie_name,
+                ctx.country,
+                self._country_header,
+            )
             bot = ctx.bot if isinstance(ctx.bot, bool) else is_bot(req.user_agent)
             if bot:
                 config = yield
@@ -601,22 +632,39 @@ class Leverprice:
             config = yield
             if config is None:
                 return self._no_config(product_key, guard, scope)
+            if not isinstance(ctx.country, str) and self._country_header is None and config.country_header is not None:
+                req = replace(req, country=normalize_country(read_header(source, config.country_header)))
             product = config.products.get(product_key)
             if product is None:
                 return _fallback(product_key, guard, "unknown_product")
             if product.currency != guard.currency:
                 return _fallback(product_key, guard, "currency_mismatch")
-            exp = product.experiment
+            exp = _experiment_for(product, req.country)
             if exp is None:
-                if _in_bounds(guard, product, product.price):
-                    return _price_quote(product_key, guard, product.price, "base_price", product.checkout_url)
+                if not _in_range(product, product.price):
+                    return _fallback(product_key, guard, "out_of_bounds")
+                region = self._region_for(guard, product, req.country)
+                if region is not None:
+                    return _regional_quote(product_key, region, req.country)
+                return _price_quote(product_key, guard, product.price, "base_price", product.checkout_url, req.country)
+            if not exp.variants or not all(_in_range(product, v.price) for v in exp.variants):
                 return _fallback(product_key, guard, "out_of_bounds")
-            if not exp.variants or not all(_in_bounds(guard, product, v.price) for v in exp.variants):
-                return _fallback(product_key, guard, "out_of_bounds")
-            return self._experiment_quote(product_key, guard, ctx, req, scope, config, product, exp)
+            region = self._region_for(guard, product, req.country)
+            return self._experiment_quote(product_key, guard, ctx, req, scope, config, product, exp, region)
         except Exception as err:
             self._report(err)
             return _fallback(product_key, guard, "bot") if bot else self._no_config(product_key, guard, scope)
+
+    def _region_for(self, guard: _Guard, product: ConfigProduct, country: Optional[str]) -> Optional[_Region]:
+        if country is None:
+            return None
+        index = product.region_of.get(country)
+        if index is None:
+            return None
+        region = product.regions[index]
+        if region.currency != guard.currency and not self._local_currencies:
+            return None
+        return _Region(index, region.currency, region.price)
 
     def _experiment_quote(
         self,
@@ -628,6 +676,7 @@ class Leverprice:
         config: Config,
         product: ConfigProduct,
         exp: ConfigExperiment,
+        region: Optional[_Region],
     ) -> Quote:
         key = self._hmac_key(config.assignment_key)
         user_id = _normalize_user_id(ctx.user_id)
@@ -655,15 +704,18 @@ class Leverprice:
 
         assigned = state.a.get(exp.id)
         sticky = next((v for v in exp.variants if v.id == assigned), None) if assigned is not None else None
-        variant = sticky if sticky is not None else _pick_variant(exp.variants, _bucket(exp.salt, visitor_id))
         if sticky is None:
+            weights = None if req.country is None else exp.split_of.get(req.country)
+            variant = _pick_variant(exp.variants, _bucket(exp.salt, visitor_id), weights)
             assign(state, exp.id, variant.id)
             changed = True
+        else:
+            variant = sticky
 
         with self._queue_lock:
             logged = exp.id in state.x or f"{exp.id}:{visitor_id}" in self._exposed
         if not logged and ctx.auto_exposure and not req.prefetch:
-            self._record_exposure(exp.id, variant.id, visitor_id)
+            self._record_exposure(exp.id, variant.id, visitor_id, req.country)
             logged = True
         if logged and mark_exposed(state, exp.id):
             changed = True
@@ -679,10 +731,14 @@ class Leverprice:
                     self._cookie_name, value, self._cookie_max_age, self._cookie_secure, self._cookie_domain
                 )
             )
+        if region is None:
+            price, currency, checkout_url = variant.price, guard.currency, variant.checkout_url or product.checkout_url
+        else:
+            price, currency, checkout_url = variant.regional[region.index], region.currency, None
         return Quote(
             product_key=product_key,
-            price=variant.price,
-            currency=guard.currency,
+            price=price,
+            currency=currency,
             is_fallback=False,
             reason="experiment",
             experiment_id=exp.id,
@@ -690,13 +746,15 @@ class Leverprice:
             visitor_id=visitor_id,
             metadata={"pp_exp": exp.id, "pp_var": variant.id, "pp_vid": visitor_id, "pp_sig": signature},
             set_cookie=set_cookie,
-            checkout_url=variant.checkout_url or product.checkout_url,
+            checkout_url=checkout_url,
             exposure_logged=logged,
+            country=req.country,
+            regional=region is not None,
         )
 
     def _bot_quote(self, product_key: str, guard: _Guard, config: Optional[Config]) -> Quote:
         product = config.products.get(product_key) if config is not None else None
-        if product is not None and product.currency == guard.currency and _in_bounds(guard, product, product.price):
+        if product is not None and product.currency == guard.currency and _in_range(product, product.price):
             return _price_quote(product_key, guard, product.price, "bot", product.checkout_url)
         return _fallback(product_key, guard, "bot")
 
@@ -736,7 +794,8 @@ class Leverprice:
             return ready
         flight = self._live_flight(now)
         if flight is None:
-            return None
+            # The fetch started by the kick may already have finished.
+            return self._usable(self._clock())
         remaining = self._timeout_ms - (now - flight.started_at)
         if remaining > 0:
             flight.done.wait(remaining / 1000)
@@ -750,7 +809,7 @@ class Leverprice:
             return ready
         flight = self._live_flight(now)
         if flight is None:
-            return None
+            return self._usable(self._clock())
         remaining = self._timeout_ms - (now - flight.started_at)
         if remaining > 0:
             await flight.wait_async(remaining / 1000)
@@ -910,7 +969,9 @@ class Leverprice:
         except TypeError:
             return None
 
-    def _record_exposure(self, experiment_id: str, variant_id: str, visitor_id: str) -> bool:
+    def _record_exposure(
+        self, experiment_id: str, variant_id: str, visitor_id: str, country: Optional[str] = None
+    ) -> bool:
         key = f"{experiment_id}:{visitor_id}"
         with self._queue_lock:
             if key in self._exposed:
@@ -918,15 +979,16 @@ class Leverprice:
             if len(self._exposed) >= MAX_DEDUPE:
                 self._exposed.clear()
             self._exposed.add(key)
-        return self._enqueue(
-            {
-                "type": "exposure",
-                "experimentId": experiment_id,
-                "variantId": variant_id,
-                "visitorId": visitor_id,
-                "timestamp": self._clock(),
-            }
-        )
+        event: Event = {
+            "type": "exposure",
+            "experimentId": experiment_id,
+            "variantId": variant_id,
+            "visitorId": visitor_id,
+            "timestamp": self._clock(),
+        }
+        if country:
+            event["country"] = country
+        return self._enqueue(event)
 
     def _enqueue(self, event: Event) -> bool:
         problem = event_problem(event)
@@ -1118,7 +1180,7 @@ def _normalize_guards(products: Any) -> Dict[str, _Guard]:
         if isinstance(guard, ProductGuard):
             values = {f: getattr(guard, f) for f in _GUARD_FIELDS}
         elif isinstance(guard, Mapping):
-            unknown = sorted(str(k) for k in guard if k not in _GUARD_FIELDS)
+            unknown = sorted(str(k) for k in guard if k not in _GUARD_FIELDS and k not in _DEPRECATED_GUARD_FIELDS)
             if unknown:
                 raise ValueError(f"{where}: unknown option {', '.join(unknown)}")
             values = {f: guard.get(f) for f in _GUARD_FIELDS}
@@ -1130,12 +1192,18 @@ def _normalize_guards(products: Any) -> Dict[str, _Guard]:
         fallback = _strict_int(values["fallback_price"])
         if fallback is None or fallback <= 0:
             raise ValueError(f"{where}.fallback_price must be a positive integer (minor units)")
-        min_price = 1 if values["min_price"] is None else _strict_int(values["min_price"])
-        max_price = MAX_SAFE_INTEGER if values["max_price"] is None else _strict_int(values["max_price"])
-        if min_price is None or max_price is None or min_price > max_price:
-            raise ValueError(f"{where}: min_price and max_price must be integers with min_price <= max_price")
-        guards[key] = _Guard(currency.lower(), fallback, min_price, max_price)
+        guards[key] = _Guard(currency.lower(), fallback)
     return guards
+
+
+def _header_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    name = value.strip(ASCII_WHITESPACE) if isinstance(value, str) else None
+    if name is None or (name and not _HEADER_NAME_RE.fullmatch(name)):
+        raise ValueError("Leverprice: country_header is not a valid header name")
+    # Lowercased only after the check, so case mapping never sees anything but ASCII.
+    return name.lower() or None
 
 
 def _transport_callable(transport: Any) -> Callable[..., Any]:
@@ -1188,7 +1256,19 @@ def _metadata_value(metadata: Any, key: str) -> Any:
         return None
 
 
+def _metadata_mapping(metadata: Any) -> Any:
+    """Stripe objects are not dicts since stripe-python 15 and have ``to_dict()`` instead of ``get()``."""
+    try:
+        if callable(getattr(metadata, "get", None)):
+            return metadata
+        to_dict = getattr(metadata, "to_dict", None)
+        return to_dict() if callable(to_dict) else None
+    except Exception:
+        return None
+
+
 def _attribution(metadata: Any) -> Optional[Dict[str, Any]]:
+    metadata = _metadata_mapping(metadata)
     ids = [_metadata_value(metadata, k) for k in ("pp_exp", "pp_var", "pp_vid")]
     if not all(is_id(i) for i in ids):
         return None
@@ -1201,12 +1281,15 @@ def _attribution(metadata: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def _in_bounds(guard: _Guard, product: ConfigProduct, price: int) -> bool:
-    return (
-        safe_int(price) is not None
-        and price > 0
-        and max(guard.min_price, product.min_price) <= price <= min(guard.max_price, product.max_price)
-    )
+def _experiment_for(product: ConfigProduct, country: Optional[str]) -> Optional[ConfigExperiment]:
+    exp = product.experiment
+    if exp is None or exp.scope is None:
+        return exp
+    return exp if country is not None and country in exp.scope else None
+
+
+def _in_range(product: ConfigProduct, price: int) -> bool:
+    return safe_int(price) is not None and price > 0 and product.min_price <= price <= product.max_price
 
 
 def _fallback(product_key: str, guard: _Guard, reason: str, set_cookie: Optional[List[str]] = None) -> Quote:
@@ -1220,7 +1303,14 @@ def _fallback(product_key: str, guard: _Guard, reason: str, set_cookie: Optional
     )
 
 
-def _price_quote(product_key: str, guard: _Guard, price: int, reason: str, checkout_url: Optional[str]) -> Quote:
+def _price_quote(
+    product_key: str,
+    guard: _Guard,
+    price: int,
+    reason: str,
+    checkout_url: Optional[str],
+    country: Optional[str] = None,
+) -> Quote:
     return Quote(
         product_key=product_key,
         price=price,
@@ -1228,6 +1318,19 @@ def _price_quote(product_key: str, guard: _Guard, price: int, reason: str, check
         is_fallback=False,
         reason=reason,
         checkout_url=checkout_url,
+        country=country,
+    )
+
+
+def _regional_quote(product_key: str, region: _Region, country: Optional[str]) -> Quote:
+    return Quote(
+        product_key=product_key,
+        price=region.price,
+        currency=region.currency,
+        is_fallback=False,
+        reason="base_price",
+        country=country,
+        regional=True,
     )
 
 
@@ -1255,10 +1358,14 @@ def _bucket(salt: str, visitor_id: str) -> int:
     return int.from_bytes(sha256(f"{salt}:{visitor_id}")[:4], "big") % 10_000
 
 
-def _pick_variant(variants: Tuple[ConfigVariant, ...], bucket: int) -> ConfigVariant:
+def _pick_variant(
+    variants: Tuple[ConfigVariant, ...], bucket: int, weights: Optional[Tuple[int, ...]] = None
+) -> ConfigVariant:
+    if weights is None:
+        weights = tuple(variant.weight for variant in variants)
     total = 0
-    for variant in variants:
-        total += variant.weight
+    for variant, weight in zip(variants, weights):
+        total += weight
         if bucket < total:
             return variant
     return variants[-1]

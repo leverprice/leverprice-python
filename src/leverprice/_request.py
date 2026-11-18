@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import contextlib
 import re
+import string
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from ._util import decode_uri_component, js_trim
+from ._util import ASCII_WHITESPACE, decode_uri_component, js_trim
 
 _PURPOSE_RE = re.compile(r"prefetch|prerender|preview", re.IGNORECASE | re.ASCII)
 _SPLIT_RE = re.compile(r"[;,]")
 _MULTI_GETTERS = ("getlist", "getall", "get_all", "get_list")
 _SCALARS = (dict, list, tuple, str, bytes)
+# Two ASCII letters with ASCII whitespace around them at most: case mapping must never invent a code.
+_ASCII_SPACES = "[" + re.escape(ASCII_WHITESPACE) + "]*"
+_COUNTRY_INPUT_RE = re.compile(_ASCII_SPACES + "([A-Za-z]{2})" + _ASCII_SPACES)
+# Header names are ASCII: Unicode case mapping would let U+212A stand in for "k".
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+_ASCII_UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
+# What CDNs send for an unknown country, Tor, anonymous proxies and non-countries.
+_NOT_A_COUNTRY = frozenset(("XX", "ZZ", "T1", "A1", "A2", "AP", "EU"))
 
 
 @dataclass(frozen=True)
@@ -20,6 +29,7 @@ class RequestInfo:
     pinned: bool
     user_agent: Optional[str]
     prefetch: bool
+    country: Optional[str]
 
 
 def unwrap(request: Any) -> Any:
@@ -84,7 +94,7 @@ def header_values(source: Any, name: str) -> List[str]:
         for pair in source:
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
                 key = _name(pair[0])
-                if key is not None and key.lower() == lower:
+                if key is not None and key.translate(_ASCII_LOWER) == lower:
                     values.extend(_strings(pair[1]))
         return values
     if not isinstance(source, dict):
@@ -109,7 +119,7 @@ def header_values(source: Any, name: str) -> List[str]:
         try:
             for key in list(keys()):
                 k = _name(key)
-                if k is not None and (k.lower() == lower or k.upper() == cgi):
+                if k is not None and (k.translate(_ASCII_LOWER) == lower or k.translate(_ASCII_UPPER) == cgi):
                     found = _strings(source[key])
                     if found:
                         return found
@@ -150,14 +160,29 @@ def cookie_values(header: Optional[str], name: str) -> List[str]:
 def is_prefetch(source: Any) -> bool:
     if source is None:
         return False
-    for name in ("sec-purpose", "purpose", "x-purpose", "x-moz"):
+    for name in ("sec-purpose", "x-sec-purpose", "purpose", "x-purpose", "x-moz"):
         value = read_header(source, name)
         if value and _PURPOSE_RE.search(value):
             return True
     return read_header(source, "next-router-prefetch") == "1"
 
 
-def read_request(source: Any, cookie: Any, user_agent: Any, cookie_name: str) -> RequestInfo:
+def normalize_country(value: Any) -> Optional[str]:
+    match = _COUNTRY_INPUT_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return None
+    code: str = match.group(1).upper()
+    return None if code in _NOT_A_COUNTRY else code
+
+
+def read_request(
+    source: Any,
+    cookie: Any,
+    user_agent: Any,
+    cookie_name: str,
+    country: Any = None,
+    country_header: Optional[str] = None,
+) -> RequestInfo:
     explicit = cookie if isinstance(cookie, str) else None
     cookie_input = explicit if explicit is not None else read_header(source, "cookie")
     pinned = False
@@ -168,4 +193,6 @@ def read_request(source: Any, cookie: Any, user_agent: Any, cookie_name: str) ->
         assignment = cookie_values(cookie_input, cookie_name)
         pinned = bool(cookie_values(cookie_input, cookie_name + "_f"))
     ua = user_agent if isinstance(user_agent, str) else read_header(source, "user-agent")
-    return RequestInfo(cookie_input, assignment, pinned, ua, is_prefetch(source))
+    if not isinstance(country, str):
+        country = read_header(source, country_header) if country_header else None
+    return RequestInfo(cookie_input, assignment, pinned, ua, is_prefetch(source), normalize_country(country))

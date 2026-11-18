@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-11-18
+
+Cookies and the wire protocol are compatible with 0.3.
+
+### Changed
+
+- Limits set in code (`min_price`, `max_price`) no longer hold prices: the product's range set in Leverprice applies. If your limits were tighter than that range, tighten it in the dashboard before you upgrade.
+
+### Added
+
+- Settings live in Leverprice, not in code: the product's price range and the header that carries the visitor's country (Project settings → Visitor country) arrive in the signed config. `min_price` and `max_price` in code are no longer used; 0.3 code that sets them keeps running.
+- Regional prices: a product can cost something else in each country, in your currency or the visitor's. `country` argument of `get_price` and `get_price_async`, `country` / `regional` on the quote, and a `country_header` option that overrides the project setting. Prices in the visitor's currency need `local_currencies=True` (set it when your checkout charges `quote.currency`); `quote.currency` is then the region's currency.
+- Exposures carry the visitor's country when it is known.
+- Tests by country: a test can run in selected countries only, and countries can be split between the prices their own way. Both are set in the dashboard; the SDK only needs the visitor's country.
+- `track_purchase()` and `track_refund()` accept the providers `paddle` and `creem`.
+
+### Fixed
+
+- A request arriving at the moment a config fetch completed could get the fallback price with reason `no_config`; it now gets the config that was just loaded.
+- Turbo 8 hover prefetches (`X-Sec-Purpose: prefetch`) are priced but no longer counted as exposures, like other prefetches.
+- `track_purchase` reads attribution from Stripe objects, which are no longer dicts since stripe-python 15. Before, `metadata=session.metadata` sent the purchase without attribution.
+- README: the Stripe example uses `StripeClient` and works with stripe-python 15 and later. The webhook counts only paid Checkout Sessions, handles `checkout.session.async_payment_succeeded` and reports a subscription's first payment by its PaymentIntent id (as verified webhooks do) and skips $0 sessions.
+
 ## [0.3.0] - 2026-11-17
 
 First release of the Python SDK, implementing protocol v2 of the Leverprice server SDK specification.
@@ -16,4 +39,5 @@ First release of the Python SDK, implementing protocol v2 of the Leverprice serv
 - Kill switch through `disabled=True` or `LEVERPRICE_DISABLED`.
 - Fork safety for pre-forking servers.
 
+[0.4.0]: https://github.com/leverprice/leverprice-python/releases/tag/v0.4.0
 [0.3.0]: https://github.com/leverprice/leverprice-python/releases/tag/v0.3.0

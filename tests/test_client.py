@@ -1,33 +1,42 @@
 from __future__ import annotations
 
+import itertools
 import json
 import logging
+import string
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
 import leverprice
 from _support import (
     CHROME,
+    COUNTRY_TEST_GUARDS,
     GOOGLEBOT,
     GUARDS,
     PIN,
+    REGIONAL_GUARDS,
+    REGIONS,
     SECRET,
     Call,
     Clock,
     FakeServer,
     Headers,
     SigningKeys,
+    b64url,
     b64url_decode,
     config_payload,
+    country_test_products,
     decode_cookie,
     default_products,
     make_client,
+    regional_products,
     wait_for,
     wait_idle,
 )
@@ -37,11 +46,13 @@ from leverprice import (
     SDK_VERSION,
     Leverprice,
     ProductGuard,
+    Quote,
     TransportResponse,
     UnknownProductError,
     _client,
 )
 from leverprice._ed25519 import decode_point
+from leverprice._wire import MAX_REGIONS, MAX_SCOPE, MAX_SPLITS, ConfigExperiment, ConfigRegion, parse_config
 
 KEYS = SigningKeys()
 
@@ -49,6 +60,16 @@ KEYS = SigningKeys()
 @pytest.fixture
 def server() -> FakeServer:
     return FakeServer(KEYS.envelope(config_payload()))
+
+
+@pytest.fixture
+def regional_server() -> FakeServer:
+    return FakeServer(KEYS.envelope(config_payload(products=regional_products())))
+
+
+@pytest.fixture
+def country_test_server() -> FakeServer:
+    return FakeServer(KEYS.envelope(config_payload(products=country_test_products())))
 
 
 @pytest.fixture
@@ -71,7 +92,7 @@ def test_public_constants() -> None:
         assert len(raw) == 32
         assert decode_point(raw) is not None
     assert MIN_KEYSET_VERSION == 1
-    assert SDK_VERSION == leverprice.__version__ == "0.3.0"
+    assert SDK_VERSION == leverprice.__version__ == "0.4.0"
     with pytest.raises(TypeError):
         ROOT_PUBLIC_KEYS["r2"] = "x"  # type: ignore[index]
 
@@ -86,11 +107,11 @@ def test_request_headers_and_body(server: FakeServer, errors: List[Exception]) -
     assert post.url == "https://api.example.test/v1/events"
     for call in (get, post):
         assert call.headers["Authorization"] == f"Bearer {SECRET}"
-        assert call.headers["User-Agent"] == "leverprice-sdk-python/0.3.0"
+        assert call.headers["User-Agent"] == "leverprice-sdk-python/0.4.0"
         assert not any(k.lower() == "origin" for k in call.headers)
     assert "If-None-Match" not in get.headers
     assert post.headers["Content-Type"] == "application/json"
-    assert json.loads(post.body or b"")["sdk"] == {"name": "leverprice-python", "version": "0.3.0"}
+    assert json.loads(post.body or b"")["sdk"] == {"name": "leverprice-python", "version": "0.4.0"}
     assert errors == []
 
 
@@ -122,6 +143,22 @@ def test_cold_start_times_out(server: FakeServer, errors: List[Exception]) -> No
     assert 0.12 <= max(ends) - start < 1.0
     assert max(ends) - min(ends) < 0.1
     assert len(server.config_calls) == 1
+
+
+def test_config_loaded_between_kick_and_wait_is_served(
+    server: FakeServer, errors: List[Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lp = make_client(server, errors=errors)
+    kick = lp._kick
+
+    def kick_and_finish(now: int) -> None:
+        kick(now)
+        wait_idle(lp)
+
+    monkeypatch.setattr(lp, "_kick", kick_and_finish)
+    assert lp.get_price("basic", new_visitor()).reason == "base_price"
+    assert len(server.config_calls) == 1
+    assert errors == []
 
 
 def test_outage_pins_the_fallback(server: FakeServer, errors: List[Exception]) -> None:
@@ -359,6 +396,143 @@ def test_malformed_products_reported_once_per_version(server: FakeServer, errors
     assert lp.get_price("broken", new_visitor()).reason == "unknown_product"
 
 
+def test_malformed_regions_drop_the_product(errors: List[Exception]) -> None:
+    base = {"id": "prod", "currency": "usd", "price": 2900, "minPrice": 1900, "maxPrice": 4900}
+    codes = ["".join(pair) for pair in itertools.product(string.ascii_uppercase, repeat=2)]
+    many = [{"countries": [code], "currency": "usd", "price": 2000} for code in codes[: MAX_REGIONS + 1]]
+
+    def region(**fields: Any) -> List[Dict[str, Any]]:
+        return [{"countries": ["IN"], "currency": "inr", "price": 99_900, **fields}]
+
+    def experiment(*regional: Any) -> Dict[str, Any]:
+        variants: List[Dict[str, Any]] = []
+        for index, prices in enumerate(regional):
+            variant = {"id": f"var_{index}", "price": 1900, "weight": 5000}
+            variants.append(variant if prices is None else {**variant, "regional": prices})
+        return {"id": "exp_1", "salt": "s", "variants": variants}
+
+    products = {
+        "flat": {**base, "regions": []},
+        "none": {**base, "regions": None},
+        "geo": {**base, "regions": REGIONS},
+        "test": {**base, "regions": REGIONS, "experiment": experiment([1300, 64_900], [2700, 129_900])},
+        "ignored": {**base, "experiment": experiment([1], "junk")},
+        "most": {**base, "regions": many[:MAX_REGIONS]},
+        "many": {**base, "regions": many},
+        "twice": {**base, "regions": [*REGIONS, *region(currency="usd")]},
+        "repeat": {**base, "regions": region(countries=["IN", "IN"])},
+        "lower": {**base, "regions": region(countries=["in"])},
+        "empty": {**base, "regions": region(countries=[])},
+        "free": {**base, "regions": region(price=0)},
+        "half": {**base, "regions": region(price=1.5)},
+        "flag": {**base, "regions": region(price=True)},
+        "money": {**base, "regions": region(currency="rupee")},
+        "shape": {**base, "regions": {"IN": 1}},
+        "short": {**base, "regions": REGIONS, "experiment": experiment([1300], [2700, 129_900])},
+        "missing": {**base, "regions": REGIONS, "experiment": experiment([1300, 64_900], None)},
+        "zero": {**base, "regions": REGIONS, "experiment": experiment([1300, 0], [2700, 129_900])},
+    }
+    lp = make_client(FakeServer(KEYS.envelope(config_payload(products=products))), errors=errors)
+    lp.preload()
+    assert messages(errors) == [
+        "Leverprice config v5: ignored malformed products "
+        "many, twice, repeat, lower, empty, free, half, flag, money, shape, short, missing, zero"
+    ]
+    assert lp._config is not None
+    parsed = lp._config.products
+
+    def regional(key: str) -> List[Any]:
+        running = parsed[key].experiment
+        assert running is not None
+        return [variant.regional for variant in running.variants]
+
+    assert (parsed["flat"].regions, parsed["flat"].region_of) == ((), {})
+    assert (parsed["none"].regions, parsed["none"].region_of) == ((), {})
+    assert parsed["geo"].regions[1] == ConfigRegion(("IN",), "inr", 99_900)
+    assert parsed["geo"].region_of == {"BR": 0, "MX": 0, "IN": 1}
+    assert len(parsed["most"].regions) == MAX_REGIONS
+    assert regional("test") == [(1300, 64_900), (2700, 129_900)]
+    assert regional("ignored") == [(), ()]
+
+
+def test_malformed_scopes_and_splits_drop_the_product(errors: List[Exception]) -> None:
+    base = {"currency": "usd", "price": 2900, "minPrice": 1900, "maxPrice": 4900}
+    variants = [{"id": "a", "price": 1900, "weight": 5000}, {"id": "b", "price": 3900, "weight": 5000}]
+    test = {"id": "exp_1", "salt": "s", "variants": variants}
+    codes = ["".join(pair) for pair in itertools.product(string.ascii_uppercase, repeat=2)]
+    singles = [{"countries": [code], "weights": [1, 2]} for code in codes[: MAX_SPLITS + 1]]
+
+    def scoped(countries: Any, **fields: Any) -> Dict[str, Any]:
+        return {**base, "scopedExperiment": {**test, "countries": countries, **fields}}
+
+    def split(*splits: Any) -> Dict[str, Any]:
+        return {**base, "experiment": {**test, "splits": list(splits)}}
+
+    def india(*weights: Any) -> Dict[str, Any]:
+        return {"countries": ["IN"], "weights": list(weights)}
+
+    kept = {
+        "open": {**base, "experiment": {**test, "splits": None, "countries": []}, "scopedExperiment": None},
+        "local": scoped(["IN", "BR"], splits=[india(0, 10_000)]),
+        "widest": scoped(codes[:MAX_SCOPE]),
+        "finest": split(*singles[:MAX_SPLITS]),
+        "unsplit": split(),
+    }
+    dropped = {
+        "both": {**scoped(["IN"]), "experiment": test},
+        "unscoped": {**base, "scopedExperiment": test},
+        "nowhere": scoped([]),
+        "wider": scoped(codes[: MAX_SCOPE + 1]),
+        "again": scoped(["IN", "BR", "IN"]),
+        "lower": scoped(["in"]),
+        "name": scoped(["IN", "Brazil"]),
+        "newline": scoped(["IN\n"]),
+        "number": scoped(["IN", 91]),
+        "text": scoped("IN"),
+        "weightless": scoped(["IN"], variants=[{"id": "a", "price": 1900}]),
+        "finer": split(*singles),
+        "short": split(india(10_000)),
+        "long": split(india(1, 2, 3)),
+        "negative": split(india(10_001, -1)),
+        "half": split(india(0.5, 1)),
+        "flag": split(india(True, 1)),
+        "twice": split(india(1, 2), {"countries": ["BR", "IN"], "weights": [2, 1]}),
+        "repeat": split({"countries": ["IN", "IN"], "weights": [1, 2]}),
+        "empty": split({"countries": [], "weights": [1, 2]}),
+        "code": split({"countries": ["in"], "weights": [1, 2]}),
+        "shape": {**base, "experiment": {**test, "splits": {"IN": [1, 2]}}},
+        "entry": split(["IN"]),
+    }
+    lp = make_client(FakeServer(KEYS.envelope(config_payload(products={**kept, **dropped}))), errors=errors)
+    lp.preload()
+    assert messages(errors) == ["Leverprice config v5: ignored malformed products " + ", ".join(dropped)]
+    assert lp._config is not None
+    parsed = lp._config.products
+    assert list(parsed) == list(kept)
+
+    def running(key: str) -> ConfigExperiment:
+        experiment = parsed[key].experiment
+        assert experiment is not None
+        return experiment
+
+    assert (running("open").scope, running("open").split_of) == (None, {})
+    assert (running("local").scope, running("local").split_of) == (frozenset(("BR", "IN")), {"IN": (0, 10_000)})
+    assert running("widest").scope == frozenset(codes[:MAX_SCOPE])
+    assert running("finest").split_of == dict.fromkeys(codes[:MAX_SPLITS], (1, 2))
+    assert running("unsplit").split_of == {}
+
+
+def test_config_country_header_is_kept_only_when_it_is_a_header_name() -> None:
+    def parsed(**fields: Any) -> Optional[str]:
+        config, _ = parse_config(b64url(json.dumps({**config_payload(), **fields}).encode()))
+        return config.country_header
+
+    assert parsed() is None
+    assert parsed(countryHeader="X-Geo-Country") == "x-geo-country"
+    for value in ("x-geo-country\n", " cf-ipcountry", "cf ipcountry", "\u212aey", "", None, 42, ["cf-ipcountry"]):
+        assert parsed(countryHeader=value) is None, value
+
+
 def test_events_failure_requeues_money_and_drops_exposures(server: FakeServer, errors: List[Exception]) -> None:
     server.events_handler = lambda call: TransportResponse(503, {}, b"")
     lp = make_client(server, errors=errors)
@@ -495,6 +669,49 @@ def test_manual_exposure(server: FakeServer, errors: List[Exception]) -> None:
     assert lp.log_exposure(fallback) is False
 
 
+def test_manual_exposure_sends_the_quote_country(regional_server: FakeServer, errors: List[Exception]) -> None:
+    lp = make_client(regional_server, errors=errors, products=REGIONAL_GUARDS, local_currencies=True)
+    quote = lp.get_price("geox", new_visitor(), exposure="manual", country="in")
+    unknown = lp.get_price("geox", new_visitor(), exposure="manual")
+    assert (quote.country, quote.regional, quote.exposure_logged) == ("IN", True, False)
+    assert (unknown.country, unknown.regional, unknown.exposure_logged) == (None, False, False)
+    assert lp.log_exposure(quote) is True
+    assert lp.log_exposure(unknown) is True
+    lp.flush()
+    sent = [{k: v for k, v in e.items() if k != "timestamp"} for e in regional_server.events]
+    exposure = {"type": "exposure", "experimentId": "exp_geo"}
+    assert sent == [
+        {**exposure, "variantId": quote.variant_id, "visitorId": quote.visitor_id, "country": "IN"},
+        {**exposure, "variantId": unknown.variant_id, "visitorId": unknown.visitor_id},
+    ]
+    assert errors == []
+
+
+def test_manual_exposure_is_logged_without_a_country_that_is_not_one(
+    server: FakeServer, errors: List[Exception]
+) -> None:
+    lp = make_client(server, errors=errors)
+
+    def quote(visitor_id: str, country: Any) -> Quote:
+        return Quote("pro", 1900, "usd", False, "experiment", "exp_1", "var_1", visitor_id, country=country)
+
+    for visitor_id, country in (("v1", " br "), ("v2", "\u00df"), ("v3", 42), ("v4", None)):
+        assert lp.log_exposure(quote(visitor_id, country)) is True
+    stored = SimpleNamespace(
+        reason="experiment", exposure_logged=False, experiment_id="exp_1", variant_id="var_1", visitor_id="v5"
+    )
+    assert lp.log_exposure(stored) is True  # type: ignore[arg-type]
+    lp.flush()
+    assert [(e["visitorId"], e.get("country", "none")) for e in server.events] == [
+        ("v1", "BR"),
+        ("v2", "none"),
+        ("v3", "none"),
+        ("v4", "none"),
+        ("v5", "none"),
+    ]
+    assert errors == []
+
+
 def test_same_request_shares_one_visitor(server: FakeServer, errors: List[Exception]) -> None:
     lp = make_client(server, errors=errors)
     request = Headers(new_visitor())
@@ -555,6 +772,121 @@ def test_explicit_user_agent_and_bot_quotes(server: FakeServer, errors: List[Exc
     assert (bot.reason, bot.price, bot.set_cookie, bot.is_fallback) == ("bot", 1900, [], True)
     lp.flush()
     assert server.events == []
+
+
+def test_regional_price_with_dataclass_guards(regional_server: FakeServer, errors: List[Exception]) -> None:
+    guard = ProductGuard("USD", 2900)
+    lp = make_client(
+        regional_server, errors=errors, products={"geo": guard}, country_header=" CF-IPCountry ", local_currencies=True
+    )
+    india = lp.get_price("geo", {"user-agent": CHROME, "cf-ipcountry": "in"})
+    assert (india.price, india.currency, india.country, india.regional) == (99_900, "inr", "IN", True)
+    assert (india.reason, india.is_fallback, india.checkout_url) == ("base_price", False, None)
+    elsewhere = lp.get_price("geo", {"user-agent": CHROME, "cf-ipcountry": "IN"}, country="US")
+    assert (elsewhere.price, elsewhere.currency, elsewhere.country, elsewhere.regional) == (2900, "usd", "US", False)
+    assert elsewhere.checkout_url == "https://buy.example.com/geo"
+    assert errors == []
+
+
+def test_regional_prices_in_another_currency_need_local_currencies(
+    regional_server: FakeServer, errors: List[Exception]
+) -> None:
+    usd = {"currency": "usd", "fallback_price": 2900}
+    fixed = make_client(regional_server, errors=errors, products={"geo": usd})
+    local = make_client(regional_server, errors=errors, products={"geo": usd}, local_currencies=True)
+    loose = make_client(regional_server, errors=errors, products={"geo": usd}, local_currencies="true")
+
+    def served(lp: Leverprice, country: str) -> Tuple[int, str, bool]:
+        quote = lp.get_price("geo", new_visitor(), country=country)
+        return quote.price, quote.currency, quote.regional
+
+    assert served(fixed, "IN") == served(loose, "IN") == (2900, "usd", False)
+    assert served(local, "IN") == (99_900, "inr", True)
+    assert served(fixed, "BR") == served(local, "BR") == (2000, "usd", True)
+    assert errors == []
+
+
+def test_min_and_max_price_from_0_3_are_accepted_and_ignored(errors: List[Exception]) -> None:
+    server = FakeServer(KEYS.envelope(config_payload(products={**default_products(), **regional_products()})))
+    guards: Dict[str, Dict[str, Any]] = {
+        "pro": {"currency": "usd", "fallback_price": 1900, "min_price": 3000, "max_price": 3500},
+        "team": {"currency": "usd", "fallback_price": 4900, "min_price": 9000, "max_price": 100},
+        "basic": {"currency": "usd", "fallback_price": 1000, "min_price": "5", "max_price": None},
+        "geo": {"currency": "usd", "fallback_price": 2900, "min_price": 2500, "max_price": 4900},
+    }
+    for products in (guards, {key: ProductGuard(**guard) for key, guard in guards.items()}):
+        lp = make_client(server, errors=errors, products=products)
+        pro, team = lp.get_price("pro", new_visitor()), lp.get_price("team", new_visitor())
+        assert (pro.reason, pro.variant_id, pro.price) in {("experiment", "a", 1900), ("experiment", "b", 2900)}
+        assert (team.reason, team.variant_id, team.price) in {("experiment", "c", 4900), ("experiment", "d", 5900)}
+        basic, geo = lp.get_price("basic", new_visitor()), lp.get_price("geo", new_visitor(), country="BR")
+        assert (basic.reason, basic.price) == ("base_price", 1200)
+        assert (geo.reason, geo.price, geo.currency, geo.regional) == ("base_price", 2000, "usd", True)
+        crawler = lp.get_price("pro", {"user-agent": GOOGLEBOT})
+        assert (crawler.reason, crawler.price, crawler.is_fallback) == ("bot", 2400, False)
+    assert errors == []
+
+
+def test_country_header_option_wins_over_the_project_header(errors: List[Exception]) -> None:
+    payload = {**config_payload(products=regional_products()), "countryHeader": "X-Geo-Country"}
+    server = FakeServer(KEYS.envelope(payload))
+    project = make_client(server, errors=errors, products=REGIONAL_GUARDS, local_currencies=True)
+    own = make_client(server, errors=errors, products=REGIONAL_GUARDS, country_header="CF-IPCountry")
+    both = {"user-agent": CHROME, "cf-ipcountry": "BR", "x-geo-country": "in"}
+
+    def priced(lp: Leverprice, request: Any, **options: Any) -> Tuple[Optional[str], int, str]:
+        quote = lp.get_price("geo", request, **options)
+        return quote.country, quote.price, quote.currency
+
+    assert priced(project, both) == ("IN", 99_900, "inr")
+    assert priced(own, both) == ("BR", 2000, "usd")
+    assert priced(own, {"user-agent": CHROME, "x-geo-country": "IN"}) == (None, 2900, "usd")
+    assert priced(own, both, country="MX") == ("MX", 2000, "usd")
+    assert priced(project, both, country="xx") == (None, 2900, "usd")
+    environ = {"REQUEST_METHOD": "GET", "wsgi.version": (1, 0), "HTTP_USER_AGENT": CHROME, "HTTP_X_GEO_COUNTRY": "IN"}
+    assert priced(project, environ) == ("IN", 99_900, "inr")
+    assert priced(project, {**both, "user-agent": GOOGLEBOT}) == (None, 2900, "usd")
+    assert errors == []
+
+
+def test_scoped_test_leaves_visitors_outside_its_scope_alone(
+    country_test_server: FakeServer, errors: List[Exception]
+) -> None:
+    lp = make_client(country_test_server, errors=errors, products=COUNTRY_TEST_GUARDS)
+    inside = lp.get_price("local", new_visitor(), country="BR")
+    assert (inside.reason, inside.variant_id, inside.price) == ("experiment", "a", 1900)
+    returning = {"user-agent": CHROME, "cookie": inside.set_cookie[0].split(";", 1)[0]}
+    for country in ("US", "Brazil", None):
+        outside = lp.get_price("local", returning, country=country)
+        assert (outside.reason, outside.price, outside.visitor_id) == ("base_price", 2900, None)
+        assert (outside.set_cookie, outside.exposure_logged) == ([], False)
+    assert lp.get_price("local", new_visitor(), country="US").set_cookie == []
+    back = lp.get_price("local", returning, country="BR")
+    assert (back.variant_id, back.visitor_id, back.set_cookie) == ("a", inside.visitor_id, [])
+    lp.flush()
+    assert [e["country"] for e in country_test_server.events] == ["BR"]
+    assert errors == []
+
+
+def test_split_replaces_the_weights(country_test_server: FakeServer, errors: List[Exception]) -> None:
+    lp = make_client(country_test_server, errors=errors, products=COUNTRY_TEST_GUARDS)
+
+    def variant(product: str, country: Optional[str]) -> Optional[str]:
+        return lp.get_price(product, new_visitor(), country=country).variant_id
+
+    assert [variant("split", country) for country in ("IN", "BR", None)] == ["b", "a", "a"]
+    assert [variant("local", country) for country in ("IN", "BR", None)] == ["b", "a", None]
+    assert errors == []
+
+
+def test_sticky_assignment_beats_a_split(country_test_server: FakeServer, errors: List[Exception]) -> None:
+    lp = make_client(country_test_server, errors=errors, products=COUNTRY_TEST_GUARDS)
+    first = lp.get_price("split", new_visitor(), country="BR")
+    returning = {"user-agent": CHROME, "cookie": first.set_cookie[0].split(";", 1)[0]}
+    moved = lp.get_price("split", returning, country="IN")
+    assert (first.variant_id, moved.variant_id) == ("a", "a")
+    assert (moved.visitor_id, moved.set_cookie) == (first.visitor_id, [])
+    assert errors == []
 
 
 def test_kill_switch_option(server: FakeServer, errors: List[Exception]) -> None:
@@ -680,6 +1012,29 @@ def test_track_purchase_reads_attribution_and_converts_seconds(server: FakeServe
         provider="stripe", order_id="pi_2", amount=1, currency="usd", metadata=StripeObject(quote.metadata)
     )  # type: ignore[arg-type]
     assert server.events[-1]["attribution"]["visitorId"] == quote.visitor_id
+
+    class StripeObjectV15:
+        def __init__(self, data: Dict[str, str]) -> None:
+            self._data = data
+
+        def __getattr__(self, key: str) -> Any:
+            try:
+                return self._data[key]
+            except KeyError:
+                raise AttributeError(key) from None
+
+        def __getitem__(self, key: str) -> Any:
+            return self._data[key]
+
+        def to_dict(self) -> Dict[str, str]:
+            return dict(self._data)
+
+    lp.track_purchase(
+        provider="stripe", order_id="pi_3", amount=1, currency="usd", metadata=StripeObjectV15(quote.metadata)
+    )  # type: ignore[arg-type]
+    assert server.events[-1]["attribution"]["signature"] == quote.metadata["pp_sig"]
+    lp.track_purchase(provider="stripe", order_id="pi_4", amount=1, currency="usd", metadata=["pp_exp"])  # type: ignore[arg-type]
+    assert server.events[-1]["attribution"] is None
     when = datetime(2027, 1, 15, tzinfo=timezone.utc)
     lp.track_purchase(provider="dodo", order_id="o", amount=1, currency="usd", metadata={"pp_exp": "e"}, timestamp=when)
     assert server.events[-1]["attribution"] is None
@@ -728,7 +1083,6 @@ def test_unknown_product_raises(server: FakeServer) -> None:
         ({"currency": "usd", "fallback_price": 0}, "fallback_price must be a positive integer"),
         ({"currency": "usd", "fallback_price": 19.0}, "fallback_price must be a positive integer"),
         ({"currency": "usd", "fallback_price": True}, "fallback_price must be a positive integer"),
-        ({"currency": "usd", "fallback_price": 5, "min_price": 9, "max_price": 3}, "min_price <= max_price"),
         ({"currency": "usd", "fallback_price": 5, "fallbackPrice": 5}, "unknown option fallbackPrice"),
         ({"fallback_price": 5}, "currency must be"),
     ],
@@ -736,6 +1090,22 @@ def test_unknown_product_raises(server: FakeServer) -> None:
 def test_guard_validation(guard: Dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         Leverprice(SECRET, {"pro": guard})
+
+
+def test_country_header_is_validated_before_it_is_lowercased() -> None:
+    for header in ("bad name", "x:y", "\u212aey", "\u00a0cf-ipcountry", "cf-ipcountry\u2003", 5):
+        with pytest.raises(ValueError, match="country_header"):
+            Leverprice(SECRET, {}, country_header=header)  # type: ignore[arg-type]
+    accepted = {
+        "CF-IPCountry": "cf-ipcountry",
+        " cf-ipcountry\n": "cf-ipcountry",
+        "\tX-Country\r\n": "x-country",
+        "": None,
+        "  ": None,
+    }
+    for header, name in accepted.items():
+        assert Leverprice(SECRET, {}, country_header=header)._country_header == name
+    assert Leverprice(SECRET, {})._country_header is None
 
 
 def test_option_validation() -> None:

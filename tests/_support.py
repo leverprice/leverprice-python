@@ -23,12 +23,16 @@ SECRET = "pp_sk_test_" + "A1b2C3d4E5" * 4
 PIN = "__pp_f=1; Path=/; Max-Age=1800; SameSite=Lax; HttpOnly; Secure"
 
 QUOTE_GUARDS: Dict[str, Dict[str, Any]] = {
-    "pro": {"currency": "usd", "fallback_price": 1900, "min_price": 1500, "max_price": 3900},
+    "pro": {"currency": "usd", "fallback_price": 1900},
     "basic": {"currency": "usd", "fallback_price": 1000},
-    "euro": {"currency": "eur", "fallback_price": 1200, "min_price": 100, "max_price": 5000},
-    "wild": {"currency": "usd", "fallback_price": 2000, "min_price": 1000, "max_price": 3000},
+    "euro": {"currency": "eur", "fallback_price": 1200},
+    "wild": {"currency": "usd", "fallback_price": 2000},
     "bad": {"currency": "usd", "fallback_price": 150},
     "ghost": {"currency": "usd", "fallback_price": 4900},
+    "geo": {"currency": "usd", "fallback_price": 2900},
+    "geox": {"currency": "usd", "fallback_price": 2900},
+    "badgeo": {"currency": "usd", "fallback_price": 2900},
+    "badgeox": {"currency": "usd", "fallback_price": 2900},
 }
 
 
@@ -184,6 +188,57 @@ GUARDS: Dict[str, Dict[str, Any]] = {
     "pro": {"currency": "usd", "fallback_price": 1900},
     "team": {"currency": "usd", "fallback_price": 4900},
     "basic": {"currency": "usd", "fallback_price": 1000},
+}
+
+REGIONS: List[Dict[str, Any]] = [
+    {"countries": ["BR", "MX"], "currency": "usd", "price": 2000},
+    {"countries": ["IN"], "currency": "INR", "price": 99_900},
+]
+
+
+def regional_products() -> Dict[str, Any]:
+    geo = {
+        "id": "prod_geo",
+        "currency": "usd",
+        "price": 2900,
+        "minPrice": 1900,
+        "maxPrice": 4900,
+        "checkoutUrl": "https://buy.example.com/geo",
+        "regions": REGIONS,
+    }
+    experiment = {
+        "id": "exp_geo",
+        "salt": "s3",
+        "variants": [
+            {"id": "a", "price": 1900, "weight": 5000, "regional": [1300, 64_900]},
+            {"id": "b", "price": 3900, "weight": 5000, "regional": [2700, 129_900]},
+        ],
+    }
+    return {"geo": geo, "geox": {**geo, "id": "prod_geox", "experiment": experiment}}
+
+
+REGIONAL_GUARDS: Dict[str, Dict[str, Any]] = {
+    key: {"currency": "usd", "fallback_price": 2900} for key in ("geo", "geox")
+}
+
+
+def country_test_products() -> Dict[str, Any]:
+    """Tests where every visitor gets variant ``a``, except visitors from India, who all get ``b``."""
+    product = {"currency": "usd", "price": 2900, "minPrice": 1900, "maxPrice": 4900}
+    test = {
+        "salt": "s4",
+        "variants": [{"id": "a", "price": 1900, "weight": 10_000}, {"id": "b", "price": 3900, "weight": 0}],
+        "splits": [{"countries": ["IN"], "weights": [0, 10_000]}],
+    }
+    scoped = {**test, "id": "exp_local", "countries": ["BR", "IN"]}
+    return {
+        "local": {**product, "id": "prod_local", "scopedExperiment": scoped},
+        "split": {**product, "id": "prod_split", "experiment": {**test, "id": "exp_split"}},
+    }
+
+
+COUNTRY_TEST_GUARDS: Dict[str, Dict[str, Any]] = {
+    key: {"currency": "usd", "fallback_price": 2900} for key in ("local", "split")
 }
 
 

@@ -36,8 +36,7 @@ from leverprice import Leverprice
 leverprice = Leverprice(
     secret_key=os.environ.get("LEVERPRICE_SECRET_KEY"),  # server-only
     products={
-        # Local guardrails: prices outside these bounds are never returned.
-        "pro": {"currency": "usd", "fallback_price": 1900, "min_price": 1500, "max_price": 3900},
+        "pro": {"currency": "usd", "fallback_price": 1900},  # your current price, served whenever Leverprice cannot answer
     },
 )
 leverprice.preload()  # optional: fetch the config at startup instead of on the first request
@@ -94,49 +93,65 @@ async def pricing(request: Request, response: Response):
 Price the checkout on the server again. Never trust a price sent by the browser.
 
 ```python
-import stripe
+import os
+
+from stripe import StripeClient
+
+stripe_client = StripeClient(os.environ["STRIPE_SECRET_KEY"])
 
 quote = leverprice.get_price("pro", request)
-session = stripe.checkout.Session.create(
-    mode="payment",
-    line_items=[
-        {
-            "quantity": 1,
-            "price_data": {"currency": quote.currency, "unit_amount": quote.price, "product_data": {"name": "Pro"}},
-        }
-    ],
-    metadata=quote.metadata,  # signed attribution: pass it whole
-    payment_intent_data={"metadata": quote.metadata},
-    success_url=success_url,
-    cancel_url=cancel_url,
+session = stripe_client.v1.checkout.sessions.create(
+    {
+        "mode": "payment",
+        "line_items": [
+            {
+                "quantity": 1,
+                "price_data": {"currency": quote.currency, "unit_amount": quote.price, "product_data": {"name": "Pro"}},
+            }
+        ],
+        "metadata": quote.metadata,  # signed attribution: pass it whole
+        "payment_intent_data": {"metadata": quote.metadata},
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+    }
 )
 ```
 
 ### 3. Report the purchase
 
-In your webhook handler (or connect your provider's webhooks to Leverprice directly):
+In your webhook handler (or connect your provider's webhooks to Leverprice directly). `payload` is the raw request body, exactly as received:
 
 ```python
-event = stripe.Webhook.construct_event(payload, signature_header, endpoint_secret)
-if event["type"] == "checkout.session.completed":
-    session = event["data"]["object"]
-    leverprice.track_purchase(
-        provider="stripe",
-        order_id=session["payment_intent"],
-        amount=session["amount_total"] - (session["total_details"] or {}).get("amount_tax", 0),
-        currency=session["currency"],
-        metadata=session["metadata"],
-        timestamp=event["created"],  # Unix seconds are detected
-    )
+PAID = ("checkout.session.completed", "checkout.session.async_payment_succeeded")
+
+event = stripe_client.construct_event(payload, signature_header, endpoint_secret)
+if event.type in PAID:
+    session = event.data.object
+    if session.payment_status == "paid" and session.payment_intent and session.amount_total > 0:
+        tax = session.total_details.amount_tax if session.total_details else 0
+        leverprice.track_purchase(
+            provider="stripe",
+            order_id=session.payment_intent,
+            amount=session.amount_total - tax,
+            currency=session.currency,
+            metadata=session.metadata.to_dict() if session.metadata else None,  # not a dict since stripe-python 15
+            timestamp=event.created,  # Unix seconds are detected
+        )
 ```
 
+A Checkout Session paid with a delayed method (bank debit, voucher) completes as `unpaid`. Its payment is reported by `checkout.session.async_payment_succeeded`, which is why both events are handled and only `paid` sessions count. $0 sessions (a trial start, a 100% discount) are not sales.
+
+A subscription session names the PaymentIntent of its first payment from Stripe API version 2025-03-31.basil on. On an older version, report that payment from `invoice.paid` with `billing_reason` `subscription_create`: the order id is the invoice's `payment_intent` and the attribution is in `subscription_details.metadata`, so pass `"subscription_data": {"metadata": quote.metadata}` at checkout as well.
+
 Refunds: `track_refund(provider=..., order_id=..., currency=..., refund_id=..., amount=...)`, or `refunded_total=...` for the order's cumulative refunded amount.
+
+That is all the configuration your code holds. Prices, price ranges, tests, regional prices and where the visitor's country comes from are managed in Leverprice and arrive in a signed config, so new features and new settings never need a code change.
 
 ## Guarantees
 
 - **Fails safe.** If Leverprice is off, slow (no config within 500 ms), down, misconfigured or returns anything unexpected, `get_price` returns your `fallback_price`. It never raises for those reasons.
 - **Verified config.** Root key → keyset → config signature chain, version-monotonic (no rollback, no revoked keys), time-limited.
-- **Bounded.** Every price is checked against your local `min_price`, `max_price` and `currency`.
+- **Bounded.** Every standard and test price is checked against the product's signed price range and currency; regional prices follow from them, and every country pays between 5% and 200% of the standard price.
 - **Sticky and tamper-proof.** Visitors keep their price. The assignment cookie is HMAC-signed with your project's assignment key, so rotating your API key does not reshuffle visitors.
 - **Private.** Visitor and user ids are HMAC-hashed on your server; Leverprice only sees the hash.
 - **No price flips.** A visitor who got the fallback during an outage keeps it for the rest of their session.
@@ -151,9 +166,29 @@ Pass the framework's request object: Django `HttpRequest`, Flask/Werkzeug `reque
 
 Pricing several products for one page? Pass the **same request object** to each `get_price` call: the quotes share one visitor, and the last quote's cookie carries every assignment. Plain header dicts are not shared; pass the request itself.
 
+## Regional prices
+
+Turn on regional prices for a product in the dashboard and a visitor from India pays $12, or ₹999 in rupees, where a visitor from the US pays $29. Your code stays as it is: in Leverprice, choose where your site runs under **Project settings → Visitor country** (Cloudflare, Vercel, AWS CloudFront, or the header your own proxy sets), and the SDK reads the visitor's country from that header.
+
+```python
+quote = leverprice.get_price("pro", request)  # a visitor from India
+quote.price  # 1200: India is set to $12 in the dashboard
+quote.currency  # "usd": pass both to your checkout
+quote.country  # "IN"
+quote.regional  # True
+```
+
+- **The country.** Name only a header your host or CDN sets and overwrites: a header a visitor can send themselves would let them pick their own price. To decide in code instead, pass `country_header` to the constructor (it replaces the project setting) or `country=` to `get_price` (it wins over both). Under WSGI, `CF_IPCountry` and `CF-IPCountry` arrive as the same key, so keep header names with underscores dropped in front of the app (the nginx default).
+- **Local currencies.** Regional prices in your product's currency ($12 in India instead of $29) need nothing in code. Prices in the visitor's own currency (₹999) are served only with `local_currencies=True`, which you set when your checkout charges `quote.price` in `quote.currency`; without it those visitors get the standard price, so a checkout with a fixed currency can never charge 99900 in dollars.
+- **Tests.** Each visitor still gets one sticky variant, at that variant's price for their country. A test can run in selected countries only, and countries can get their own share of traffic per price: both are set in the dashboard and need nothing from your code but the visitor's country.
+- **Checkout.** Always pass `quote.currency` with `quote.price`, also before you turn regional prices on: then they need no code change later. `checkout_url` is `None` for a regional price: hosted checkout links are made for standard prices.
+- Bots and visitors whose country is unknown get the standard price.
+
+Behind Cloudflare the header is `cf-ipcountry`, on Vercel `x-vercel-ip-country`, behind CloudFront `cloudfront-viewer-country` (once it is added to the origin request policy). `country_header` takes the HTTP header name; under WSGI and Django the SDK finds `HTTP_CF_IPCOUNTRY` for you.
+
 ## Exposures
 
-An exposure is one person seeing an experiment price. With `exposure="auto"` (default) the SDK logs it the first time a visitor gets a price from an experiment, once per visitor and experiment. Prefetch and prerender requests (`Sec-Purpose`, `Purpose`, `X-Purpose`, `X-Moz`, `Next-Router-Prefetch`) are priced but not counted.
+An exposure is one person seeing an experiment price. With `exposure="auto"` (default) the SDK logs it the first time a visitor gets a price from an experiment, once per visitor and experiment. Prefetch and prerender requests (`Sec-Purpose`, `Purpose`, `X-Purpose`, `X-Moz`, `Next-Router-Prefetch`, and Turbo's `X-Sec-Purpose`) are priced but not counted.
 
 If you compute the price before it is visible, use manual mode:
 
@@ -189,33 +224,35 @@ The client is thread-safe. Every method has an `_async` variant for asyncio apps
 
 ## Reference
 
-`get_price(product_key, request=None, *, cookie=None, user_agent=None, user_id=None, exposure="auto", bot=None) -> Quote`. Raises `UnknownProductError` only if `product_key` is missing from `products`.
+`get_price(product_key, request=None, *, cookie=None, user_agent=None, user_id=None, exposure="auto", bot=None, country=None) -> Quote`. Raises `UnknownProductError` only if `product_key` is missing from `products`.
 
 | Quote field | |
 |---|---|
 | `product_key` | The key you asked for |
 | `price` | Minor units; use it for display and as the checkout amount |
-| `currency` | Lowercase ISO 4217, from your product guard |
+| `currency` | Lowercase ISO 4217: your product's currency, or the region's for a regional price |
+| `country` | The visitor's country (ISO 3166-1 alpha-2) when known, else `None` |
+| `regional` | `True` when `price` is the regional price of `country` |
 | `is_fallback` | `True` when `price` is your `fallback_price` |
 | `reason` | See below |
 | `experiment_id`, `variant_id` | Set when `reason` is `"experiment"`, else `None` |
 | `visitor_id` | Hashed visitor id Leverprice sees; `None` unless `reason` is `"experiment"` |
 | `metadata` | `{pp_exp, pp_var, pp_vid, pp_sig}` for the checkout (signed); `{}` otherwise |
 | `set_cookie` | `Set-Cookie` values to append (zero or more) |
-| `checkout_url` | Hosted checkout link for this price, or `None` |
+| `checkout_url` | Hosted checkout link for this price, or `None` (always `None` for a regional price) |
 | `exposure_logged` | An exposure for this visitor and experiment has been logged |
 
 | `reason` | Price |
 |---|---|
 | `experiment` | The visitor's sticky variant |
-| `base_price` | Standard price (no experiment running) |
+| `base_price` | The product's price for this visitor (no experiment runs for them) |
 | `bot` | Standard price, or fallback if unavailable; never enrolled |
 | `disabled` | Fallback: kill switch, or no valid secret key |
 | `no_config` | Fallback: no usable signed config (timeout, outage, rejected or expired); sets the pin |
 | `pinned_fallback` | Fallback: this browser got a fallback during an outage in this session |
 | `unknown_product` | Fallback: the config has no such product |
 | `currency_mismatch` | Fallback: the config's currency differs from your guard |
-| `out_of_bounds` | Fallback: a price is outside your (or Leverprice's) min/max |
+| `out_of_bounds` | Fallback: a price is outside the product's signed range |
 
 | Method | |
 |---|---|
@@ -226,12 +263,12 @@ The client is thread-safe. Every method has an `_async` variant for asyncio apps
 | `refresh()` / `preload()` | Fetch the config now / only if none is usable |
 | `close()` | Flushes and stops the flush timer |
 
-Providers: `stripe`, `polar`, `lemonsqueezy`, `dodo`, `other`. Timestamps are milliseconds, Unix seconds or a `datetime`. None of these methods raise.
+Providers: `stripe`, `polar`, `lemonsqueezy`, `dodo`, `paddle`, `creem`, `other`. Timestamps are milliseconds, Unix seconds or a `datetime`. None of these methods raise.
 
 | Option | Default | |
 |---|---|---|
 | `secret_key` | required | `pp_sk_live_…` or `pp_sk_test_…` |
-| `products` | required | Product key → `{currency, fallback_price, min_price?, max_price?}` or `ProductGuard` |
+| `products` | required | Product key → `{currency, fallback_price}` or `ProductGuard` |
 | `disabled` | `False` | Kill switch |
 | `api_url` | `https://api.leverprice.com` | |
 | `timeout_ms` | `500` | Longest wait for a config when none is usable |
@@ -241,12 +278,16 @@ Providers: `stripe`, `polar`, `lemonsqueezy`, `dodo`, `other`. Timestamps are mi
 | `cookie_max_age_seconds` | `15552000` | 180 days |
 | `cookie_secure` | `True` | Set `False` only for plain-HTTP development |
 | `cookie_domain` | `None` | |
+| `country_header` | `None` | Request header your CDN or host sets to the visitor's country; overrides **Project settings → Visitor country**. See [Regional prices](#regional-prices) |
+| `local_currencies` | `False` | Serve regional prices in the visitor's currency, not only in each product's own. Set it only when your checkout charges `quote.price` in `quote.currency` |
 | `flush_interval_ms` | `2000` | Longest time exposures wait before being sent |
 | `trusted_root_keys` | `ROOT_PUBLIC_KEYS` | For staging and local development |
 | `transport` | `UrllibTransport()` | Any object with `request(method, url, headers, body, timeout)` |
 | `on_error` | log a warning | Receives every SDK error; exceptions it raises are ignored |
 
 Errors are logged on the `leverprice` logger when no `on_error` is given.
+
+**Upgrading from 0.3:** no code changes. `min_price` and `max_price` in your code are no longer used: the product's range set in Leverprice applies, and you can delete them whenever you like. If the limits in your code were tighter than that range, tighten the range in Leverprice before you upgrade. Regional prices need no code: turn them on in the dashboard and set **Project settings → Visitor country**. Add `local_currencies=True` if your checkout passes `quote.currency` and you want prices in visitors' own currencies.
 
 ## License
 
